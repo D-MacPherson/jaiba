@@ -190,12 +190,8 @@ fn save_edit(app: &mut App) {
             Some(idx)
         }
         None => {
-            if entry.name.trim().is_empty() {
-                None
-            } else {
-                app.entries.push(entry);
-                Some(app.entries.len() - 1)
-            }
+            app.entries.push(entry);
+            Some(app.entries.len() - 1)
         }
     };
 
@@ -280,4 +276,211 @@ fn delete_current_entry(app: &mut App) {
 
     reset_edit_state(app);
     app.status = Some("Entry deleted".to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_edit_input;
+    use crate::app::{App, ExportStep, ImportStep, PasswordChangeStep, Screen};
+    use crate::config::Config;
+    use crate::db::{create_database, unlock_database};
+    use crate::theme::Theme;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::widgets::{ListState, TableState};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    const TEST_PASSWORD: &str = "correct horse";
+    const NAME_FIELD: usize = 0;
+    const PASSWORD_FIELD: usize = 2;
+    const NOTES_FIELD: usize = 5;
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("jaiba-edit-test-{}-{id}", std::process::id()));
+            fs::create_dir_all(&path).expect("test directory should be created");
+            Self(path)
+        }
+
+        fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+            self.0.join(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_app(database_path: &Path) -> App {
+        let (database, key, entries) = create_database(database_path, TEST_PASSWORD, None)
+            .expect("disposable database should be created");
+
+        App {
+            screen: Screen::Index,
+            password: String::new(),
+            query: String::new(),
+            max_len: 0,
+            index_state: TableState::default().with_selected(Some(0)),
+            edit_state: ListState::default(),
+            reveal_password: false,
+            edit_entry: None,
+            edit_original: None,
+            edit_target: None,
+            editing_field: false,
+            field_buffer: String::new(),
+            confirm_delete: false,
+            confirm_exit: false,
+            entries,
+            filtered: Vec::new(),
+            kdbx: Some(database),
+            db_key: Some(key),
+            theme: Theme::default(),
+            config: Config {
+                default_database: Some(database_path.to_path_buf()),
+                ..Config::default()
+            },
+            creating_database: false,
+            confirming_new_db_password: false,
+            new_db_confirm: String::new(),
+            available_themes: Vec::new(),
+            settings_state: ListState::default(),
+            choosing_theme: false,
+            theme_state: ListState::default(),
+            changing_password: false,
+            password_change_step: PasswordChangeStep::CurrentPassword,
+            current_password_buffer: String::new(),
+            new_password_buffer: String::new(),
+            new_password_confirm: String::new(),
+            importing_database: false,
+            import_step: ImportStep::Path,
+            import_path_buffer: String::new(),
+            import_kdbx_password_buffer: String::new(),
+            pending_import_path: None,
+            exporting_database: false,
+            export_step: ExportStep::Path,
+            export_path_buffer: String::new(),
+            pending_export_path: None,
+            login_error: None,
+            last_activity: Instant::now(),
+            status: None,
+            clipboard: None,
+            clipboard_timer: None,
+            should_quit: false,
+            slim_mode: true,
+        }
+    }
+
+    fn start_new_entry(app: &mut App) {
+        crate::input::index::handle_index_input(
+            app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+
+        assert!(
+            matches!(app.screen, Screen::Edit),
+            "ctrl+a should open the edit screen"
+        );
+        assert_eq!(app.edit_target, None, "ctrl+a should target a new entry");
+    }
+
+    fn select_field(app: &mut App, field: usize) {
+        while app.edit_state.selected() != Some(field) {
+            handle_edit_input(app, KeyCode::Down);
+        }
+    }
+
+    fn set_field(app: &mut App, field: usize, value: &str) {
+        select_field(app, field);
+        handle_edit_input(app, KeyCode::Enter);
+        assert!(app.editing_field, "enter should start editing the field");
+
+        for character in value.chars() {
+            handle_edit_input(app, KeyCode::Char(character));
+        }
+
+        handle_edit_input(app, KeyCode::Enter);
+        assert!(!app.editing_field, "enter should commit the field");
+    }
+
+    fn close_and_save(app: &mut App) {
+        handle_edit_input(app, KeyCode::Esc);
+        assert!(
+            app.confirm_exit,
+            "esc should ask to save when the entry changed"
+        );
+
+        handle_edit_input(app, KeyCode::Char('y'));
+        assert!(
+            matches!(app.screen, Screen::Index),
+            "edit screen should close"
+        );
+    }
+
+    fn reopen(database_path: &Path) -> Vec<crate::db::Entry> {
+        let (_, _, entries) = unlock_database(database_path, TEST_PASSWORD, None)
+            .expect("database should unlock again");
+        entries
+    }
+
+    #[test]
+    fn saves_new_entry_with_an_empty_title() {
+        let dir = TestDir::new();
+        let database_path = dir.join("empty-title.kdbx");
+        let mut app = test_app(&database_path);
+
+        start_new_entry(&mut app);
+        set_field(&mut app, PASSWORD_FIELD, "s3cret");
+        set_field(&mut app, NOTES_FIELD, "note text");
+        close_and_save(&mut app);
+
+        assert_eq!(app.status.as_deref(), Some("Saved"));
+        assert_eq!(app.entries.len(), 1, "the new entry should be kept");
+        assert_eq!(app.filtered.len(), 1, "the new entry should stay listed");
+
+        let entries = reopen(&database_path);
+        assert_eq!(entries.len(), 1, "the new entry should be persisted");
+
+        let entry = &entries[0];
+        assert!(entry.name.is_empty(), "the empty title should be preserved");
+        assert_eq!(entry.password, "s3cret");
+        assert_eq!(entry.notes, "note text");
+    }
+
+    #[test]
+    fn saves_new_entry_with_a_whitespace_only_title() {
+        let dir = TestDir::new();
+        let database_path = dir.join("whitespace-title.kdbx");
+        let mut app = test_app(&database_path);
+
+        start_new_entry(&mut app);
+        set_field(&mut app, NAME_FIELD, "   ");
+        set_field(&mut app, PASSWORD_FIELD, "hunter2");
+        set_field(&mut app, NOTES_FIELD, "note text");
+        close_and_save(&mut app);
+
+        assert_eq!(app.status.as_deref(), Some("Saved"));
+        assert_eq!(app.entries.len(), 1, "the new entry should be kept");
+        assert_eq!(app.filtered.len(), 1, "the new entry should stay listed");
+
+        let entries = reopen(&database_path);
+        assert_eq!(entries.len(), 1, "the new entry should be persisted");
+
+        let entry = &entries[0];
+        assert_eq!(entry.password, "hunter2");
+        assert_eq!(entry.notes, "note text");
+        // The keepass crate parses values that are entirely whitespace back as
+        // empty strings (StringValue uses cs_opt_string, which maps whitespace-only
+        // values to None). The entry itself is kept; only the title is normalized.
+        assert!(entry.name.is_empty());
+    }
 }
