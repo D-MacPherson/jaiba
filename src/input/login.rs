@@ -4,10 +4,17 @@ use crossterm::event::KeyCode;
 
 use crate::app::{App, Screen};
 use crate::config::save_config;
-use crate::db::{calculate_warnings, create_database, unlock_database};
+use crate::db::{calculate_warnings, create_database, unlock_database_snapshot};
 use crate::util::default_new_database_path;
 
 pub fn handle_login_input(app: &mut App, key: KeyCode) {
+    if key == KeyCode::Esc && app.pending_draft.is_some() {
+        app.login_error = Some(
+            "Draft only in memory. KEEP THIS WINDOW OPEN; authenticate, then save or discard."
+                .into(),
+        );
+        return;
+    }
     if app.creating_database {
         handle_create_database_input(app, key);
         return;
@@ -45,7 +52,7 @@ pub fn handle_login_input(app: &mut App, key: KeyCode) {
 }
 
 pub fn database_missing(app: &App) -> bool {
-    match &app.config.default_database {
+    match app.database_path() {
         None => true,
         Some(path) => !path.is_file(),
     }
@@ -148,14 +155,19 @@ fn finish_create_database(app: &mut App) {
         return;
     }
 
-    match create_database(&path, &app.password, app.config.keyfile.as_deref()) {
-        Ok((db, key, entries)) => {
+    match create_database(&path, &app.password, app.config.keyfile.as_deref())
+        .and_then(|_| unlock_database_snapshot(&path, &app.password, app.config.keyfile.as_deref()))
+    {
+        Ok((db, key, entries, revision)) => {
             app.config.default_database = Some(path.clone());
             let save_result = save_config(&app.config);
 
             app.kdbx = Some(db);
             app.db_key = Some(key);
+            app.primary_revision = Some(revision);
             app.entries = entries;
+            app.open_database = Some(path.clone());
+            app.open_keyfile = app.config.keyfile.clone();
             app.password.clear();
             app.new_db_confirm.clear();
             app.creating_database = false;
@@ -181,22 +193,34 @@ fn finish_create_database(app: &mut App) {
 }
 
 fn attempt_unlock(app: &mut App) {
-    let Some(path) = app.config.default_database.clone() else {
+    let Some(path) = app.database_path().map(|path| path.to_owned()) else {
         app.login_error = Some("No default_database set in jaiba_config.toml".to_string());
         return;
     };
 
-    match unlock_database(&path, &app.password, app.config.keyfile.as_deref()) {
-        Ok((db, key, mut entries)) => {
+    let keyfile = if app.open_database.is_some() {
+        app.open_keyfile.clone()
+    } else {
+        app.config.keyfile.clone()
+    };
+    match unlock_database_snapshot(&path, &app.password, keyfile.as_deref()) {
+        Ok((db, key, mut entries, revision)) => {
             calculate_warnings(&mut entries);
             app.entries = entries;
             app.kdbx = Some(db);
             app.db_key = Some(key);
+            app.primary_revision = Some(revision);
+            app.open_database = Some(path);
+            app.open_keyfile = keyfile;
             app.password.clear();
             app.login_error = None;
             app.last_activity = Instant::now();
             app.refresh_filter();
             app.screen = Screen::Index;
+            if let Err(err) = crate::recovery::recover(app) {
+                app.hide_failed_recovery();
+                app.login_error = Some(format!("Recovery failed; keep recovery files: {err}"));
+            }
         }
         Err(err) => {
             app.password.clear();

@@ -1,6 +1,8 @@
 use std::time::Instant;
 
 use arboard::Clipboard;
+use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use crate::app::App;
 use crate::terminal_clipboard;
@@ -8,7 +10,24 @@ use crate::terminal_clipboard;
 pub struct ClipboardTimer {
     pub label: String,
     pub expected: String,
+    pub fingerprint: Option<[u8; 32]>,
     pub clear_at: Instant,
+}
+
+impl ClipboardTimer {
+    pub fn forget_plaintext(&mut self) {
+        if self.fingerprint.is_none() {
+            self.fingerprint = Some(Sha256::digest(self.expected.as_bytes()).into());
+        }
+        self.expected.zeroize();
+    }
+
+    pub fn matches_text(&self, current: &str) -> bool {
+        match self.fingerprint {
+            Some(expected) => expected == <[u8; 32]>::from(Sha256::digest(current.as_bytes())),
+            None => current == self.expected,
+        }
+    }
 }
 
 fn copy_and_report(app: &mut App, label: &str, text: &str) {
@@ -38,6 +57,7 @@ fn copy_and_report(app: &mut App, label: &str, text: &str) {
             app.clipboard_timer = Some(ClipboardTimer {
                 label: label.to_string(),
                 expected: text.to_string(),
+                fingerprint: None,
                 clear_at: Instant::now() + app.config.clipboard_timeout,
             });
             app.status = None;
@@ -58,10 +78,18 @@ pub fn maybe_clear_clipboard(app: &mut App) {
         return;
     }
 
-    let expected = std::mem::take(&mut app.clipboard_timer).unwrap().expected;
+    let mut timer = app.clipboard_timer.take().unwrap();
+    timer.forget_plaintext();
 
     if let Some(clipboard) = app.clipboard.as_mut() {
-        let holds_ours = matches!(clipboard.get_text(), Ok(current) if current == expected);
+        let holds_ours = match clipboard.get_text() {
+            Ok(mut current) => {
+                let matches = timer.matches_text(&current);
+                current.zeroize();
+                matches
+            }
+            Err(_) => false,
+        };
 
         if holds_ours {
             if let Err(err) = clipboard.clear() {

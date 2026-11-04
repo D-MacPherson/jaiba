@@ -274,17 +274,13 @@ fn handle_change_password_input(app: &mut App, key: KeyCode) {
 }
 
 fn verify_current_password(app: &mut App) {
-    let Some(path) = app.config.default_database.clone() else {
+    let Some(path) = app.database_path().map(|p| p.to_owned()) else {
         app.status = Some("no unlocked database".to_string());
         cancel_change_password(app);
         return;
     };
 
-    match unlock_database(
-        &path,
-        &app.current_password_buffer,
-        app.config.keyfile.as_deref(),
-    ) {
+    match unlock_database(&path, &app.current_password_buffer, app.database_keyfile()) {
         Ok(_) => {
             app.current_password_buffer.clear();
             app.status = None;
@@ -309,8 +305,32 @@ fn commit_password_change(app: &mut App) {
         return;
     }
 
-    let new_key = match build_database_key(&app.new_password_buffer, app.config.keyfile.as_deref())
-    {
+    // Hold the same canonical database-scoped mutex used by draft publication
+    // from the pending-file check through primary replacement/verification.
+    let transaction = match app.begin_primary_write() {
+        Ok(transaction) => transaction,
+        Err(err) => {
+            let message = format!("Cannot change password: {err:#}");
+            cancel_change_password(app);
+            app.status = Some(message);
+            return;
+        }
+    };
+    if !matches!(crate::recovery::has_pending_files(app), Ok(false)) {
+        app.status = Some(
+            "Recover and save or discard all encrypted drafts before changing the master password"
+                .into(),
+        );
+        app.changing_password = false;
+        app.current_password_buffer.clear();
+        app.new_password_buffer.clear();
+        app.new_password_confirm.clear();
+        return;
+    }
+
+    #[cfg(test)]
+    crate::recovery::interleave::before_rekey();
+    let new_key = match build_database_key(&app.new_password_buffer, app.database_keyfile()) {
         Ok(key) => key,
         Err(err) => {
             app.status = Some(format!("couldn't change password: {err:#}"));
@@ -321,25 +341,34 @@ fn commit_password_change(app: &mut App) {
         }
     };
 
-    let (Some(path), Some(db)) = (app.config.default_database.clone(), app.kdbx.as_mut()) else {
+    let path = &transaction.path;
+    let Some(db) = app.kdbx.as_mut() else {
         app.status = Some("no unlocked database".to_string());
         cancel_change_password(app);
         return;
     };
 
-    app.status = Some(match save_database(&path, &new_key, db, &mut app.entries) {
-        Ok(()) => {
-            app.db_key = Some(new_key);
-            "master password changed".to_string()
-        }
-        Err(SaveError::Verification(err)) => {
-            // Replacement has happened even though final confirmation failed.
-            // Further saves must use the new key, never silently revert it.
-            app.db_key = Some(new_key);
-            format!("password change written, but could not be confirmed: {err:#}")
-        }
-        Err(err) => format!("couldn't change password: {err:#}"),
-    });
+    app.status = Some(
+        match crate::db::save_database_with_revision(
+            path,
+            &new_key,
+            db,
+            &mut app.entries,
+            &mut app.primary_revision,
+        ) {
+            Ok(()) => {
+                app.db_key = Some(new_key);
+                "master password changed".to_string()
+            }
+            Err(SaveError::Verification(err)) => {
+                // Replacement has happened even though final confirmation failed.
+                // Further saves must use the new key, never silently revert it.
+                app.db_key = Some(new_key);
+                format!("password change written, but could not be confirmed: {err:#}")
+            }
+            Err(err) => format!("couldn't change password: {err:#}"),
+        },
+    );
 
     app.changing_password = false;
     app.password_change_step = PasswordChangeStep::CurrentPassword;
@@ -465,11 +494,15 @@ fn finish_import(app: &mut App, imported: Vec<Entry>, source: &Path) {
         pending.push(entry);
     }
 
-    let (Some(path), Some(key), Some(db)) = (
-        app.config.default_database.clone(),
-        app.db_key.clone(),
-        app.kdbx.as_mut(),
-    ) else {
+    let transaction = match app.begin_primary_write() {
+        Ok(transaction) => transaction,
+        Err(err) => {
+            app.status = Some(format!("Not imported: {err:#}"));
+            reset_import_state(app);
+            return;
+        }
+    };
+    let (Some(key), Some(db)) = (app.db_key.clone(), app.kdbx.as_mut()) else {
         app.status = Some(format!(
             "Not imported: database is locked ({})",
             source.display()
@@ -478,7 +511,13 @@ fn finish_import(app: &mut App, imported: Vec<Entry>, source: &Path) {
         return;
     };
 
-    let result = save_database(&path, &key, db, &mut pending);
+    let result = crate::db::save_database_with_revision(
+        &transaction.path,
+        &key,
+        db,
+        &mut pending,
+        &mut app.primary_revision,
+    );
     if !matches!(result, Err(SaveError::Write(_))) {
         app.entries = pending;
         calculate_warnings(&mut app.entries);
@@ -588,6 +627,33 @@ fn do_export(app: &mut App) {
         return;
     };
 
+    // Export must never become an alternate, unvalidated primary write route,
+    // including plaintext targets aliased to the open primary.
+    let guard = (|| -> anyhow::Result<crate::recovery::Transaction> {
+        use std::os::unix::fs::MetadataExt;
+        let transaction = app.begin_primary_write()?;
+        match std::fs::metadata(&path) {
+            Ok(target) => {
+                let primary = std::fs::metadata(&transaction.path)?;
+                anyhow::ensure!(
+                    (target.dev(), target.ino()) != (primary.dev(), primary.ino()),
+                    "Export cannot overwrite the open primary database or its aliases"
+                );
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (),
+            Err(err) => return Err(err.into()),
+        }
+        Ok(transaction)
+    })();
+    let _transaction = match guard {
+        Ok(transaction) => transaction,
+        Err(err) => {
+            app.status = Some(format!("couldn't export: {err:#}"));
+            reset_export_state(app);
+            return;
+        }
+    };
+
     let format = match crate::export::detect_format(&path) {
         Ok(format) => format,
         Err(err) => {
@@ -601,13 +667,15 @@ fn do_export(app: &mut App) {
 
     let result: anyhow::Result<()> = match format {
         crate::export::ExportFormat::Kdbx => {
-            let (Some(key), Some(db)) = (app.db_key.clone(), app.kdbx.as_mut()) else {
+            let (Some(key), Some(mut db)) = (app.db_key.clone(), app.kdbx.clone()) else {
                 app.status = Some("no unlocked database".to_string());
                 reset_export_state(app);
                 return;
             };
 
-            save_database(&path, &key, db, &mut app.entries).map_err(|err| anyhow::anyhow!("{err}"))
+            let mut entries = app.entries.clone();
+            save_database(&path, &key, &mut db, &mut entries)
+                .map_err(|err| anyhow::anyhow!("{err}"))
         }
         crate::export::ExportFormat::Csv => crate::export::export_csv(&path, &app.entries),
         crate::export::ExportFormat::Json => crate::export::export_json(&path, &app.entries),
@@ -718,6 +786,44 @@ mod save_tests {
     use crate::db::create_database;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn password_change_refuses_to_orphan_another_sessions_encrypted_draft() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("jaiba-rekey-draft-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("synthetic.kdbx");
+        create_database(&path, "synthetic master", None).unwrap();
+        let (db, key, _, revision) =
+            crate::db::unlock_database_snapshot(&path, "synthetic master", None).unwrap();
+        let mut editing = App::for_test(Some(path.clone()));
+        editing.kdbx = Some(db.clone());
+        editing.db_key = Some(key.clone());
+        editing.primary_revision = Some(revision.clone());
+        editing.screen = Screen::Edit;
+        editing.edit_entry = Some(Entry {
+            password: "synthetic unsaved draft".into(),
+            ..Entry::default()
+        });
+        editing.edit_original = Some(Entry::default());
+        assert!(editing.lock_cooperatively());
+        let mut app = App::for_test(Some(path.clone()));
+        app.kdbx = Some(db);
+        app.db_key = Some(key);
+        app.primary_revision = Some(revision);
+        app.new_password_buffer = "new synthetic master".into();
+        app.new_password_confirm = "new synthetic master".into();
+        commit_password_change(&mut app);
+        assert!(
+            unlock_database(&path, "synthetic master", None).is_ok(),
+            "rekeying must not strand pending recovery files under the old credentials"
+        );
+        assert!(app.status.as_ref().unwrap().contains("draft"));
+        drop(editing);
+        drop(app);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn failed_import_is_not_silently_written_by_a_later_save() {

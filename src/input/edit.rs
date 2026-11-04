@@ -1,12 +1,23 @@
 use crossterm::event::KeyCode;
 
 use crate::app::{App, Screen};
-use crate::db::{SaveError, calculate_warnings, delete_entry, save_database};
+use crate::db::{SaveError, calculate_warnings};
 
 const FIELD_COUNT: usize = 7;
 const LAST_MODIFIED_INDEX: usize = 6;
 
 pub fn handle_edit_input(app: &mut App, key: KeyCode) {
+    if app.edit_deleted {
+        if app.confirm_delete {
+            handle_delete_confirmation(app, key);
+        } else if crate::input::normalize_shortcut(key) == KeyCode::Char('d') {
+            start_delete_confirmation(app);
+        } else {
+            app.status =
+                Some("Entry already deleted; recovery cleanup pending. [d] retry cleanup".into());
+        }
+        return;
+    }
     if app.editing_field {
         handle_field_input(app, key);
         return;
@@ -146,8 +157,9 @@ fn handle_exit_confirmation(app: &mut App, key: KeyCode) {
 
         KeyCode::Char('n') => {
             app.confirm_exit = false;
-            reset_edit_state(app);
-            app.status = Some("Changes discarded".to_string());
+            if reset_edit_state(app) {
+                app.status = Some("Changes discarded".to_string());
+            }
         }
 
         KeyCode::Esc => {
@@ -165,10 +177,17 @@ fn close_edit(app: &mut App) {
     }
 }
 
-fn reset_edit_state(app: &mut App) {
+fn reset_edit_state(app: &mut App) -> bool {
+    if let Err(err) = crate::recovery::retire(app) {
+        app.status = Some(format!(
+            "Could not retire recovery file; editor kept open: {err}"
+        ));
+        return false;
+    }
     app.edit_entry = None;
     app.edit_original = None;
     app.edit_target = None;
+    app.edit_deleted = false;
     app.editing_field = false;
     app.field_buffer.clear();
     app.confirm_delete = false;
@@ -176,21 +195,31 @@ fn reset_edit_state(app: &mut App) {
     app.reveal_password = false;
     app.edit_state.select(None);
     app.screen = Screen::Index;
+    true
 }
 
 fn save_edit(app: &mut App) -> bool {
     let Some(mut entry) = app.edit_entry.clone() else {
         return true;
     };
-    let (Some(db), Some(key), Some(path)) = (
-        app.kdbx.as_mut(),
-        app.db_key.as_ref(),
-        app.config.default_database.as_ref(),
-    ) else {
+    let transaction = match app.begin_primary_write() {
+        Ok(transaction) => transaction,
+        Err(err) => {
+            app.status = Some(format!("Not saved: {err:#}"));
+            return false;
+        }
+    };
+    let (Some(db), Some(key)) = (app.kdbx.as_mut(), app.db_key.as_ref()) else {
         app.status = Some("Not saved: database is locked".to_string());
         return false;
     };
-    let result = save_database(path, key, db, std::slice::from_mut(&mut entry));
+    let result = crate::db::save_database_with_revision(
+        &transaction.path,
+        key,
+        db,
+        std::slice::from_mut(&mut entry),
+        &mut app.primary_revision,
+    );
     app.edit_entry = Some(entry.clone());
     // Only expose an entry in the list once it has reached disk. If the final
     // verification failed, its ID still identifies that uncertain write on retry.
@@ -245,33 +274,48 @@ fn handle_delete_confirmation(app: &mut App, key: KeyCode) {
 }
 
 fn delete_current_entry(app: &mut App) {
-    let Some(entry) = app.edit_entry.take() else {
+    let Some(id) = app.edit_entry.as_ref().map(|entry| entry.id) else {
         reset_edit_state(app);
         return;
     };
 
-    if let Some(id) = entry.id {
-        let (Some(db), Some(key), Some(path)) = (
-            app.kdbx.as_mut(),
-            app.db_key.as_ref(),
-            app.config.default_database.as_ref(),
-        ) else {
+    let mut unconfirmed = None;
+    // Cleanup retries also repeat the idempotent deletion, so an uncertain
+    // replacement is independently confirmed before retiring its recovery file.
+    if let Some(id) = id {
+        let transaction = match app.begin_primary_write() {
+            Ok(transaction) => transaction,
+            Err(err) => {
+                app.status = Some(format!("Failed to delete: {err:#}"));
+                return;
+            }
+        };
+        let (Some(db), Some(key)) = (app.kdbx.as_mut(), app.db_key.as_ref()) else {
             app.status = Some("Not deleted: database is locked".to_string());
-            app.edit_entry = Some(entry);
             return;
         };
 
-        if let Err(err) = delete_entry(path, key, db, id) {
-            app.status = Some(format!("Failed to delete: {err:#}"));
-            app.edit_entry = Some(entry);
-            return;
+        match crate::db::delete_entry_with_revision(
+            &transaction.path,
+            key,
+            db,
+            id,
+            &mut app.primary_revision,
+        ) {
+            Ok(()) => (),
+            Err(err @ SaveError::Write(_)) => {
+                app.status = Some(format!("Failed to delete: {err:#}"));
+                return;
+            }
+            // Replacement already committed. Keep an accurate deletion marker
+            // and recoverable editor rather than recapturing a nonexistent target.
+            Err(err @ SaveError::Verification(_)) => unconfirmed = Some(err),
         }
     }
 
-    let entry_idx = entry
-        .id
+    let entry_idx = id
         .and_then(|id| app.entries.iter().position(|e| e.id == Some(id)))
-        .or(app.edit_target);
+        .or(app.edit_target.filter(|_| !app.edit_deleted));
     if let Some(idx) = entry_idx {
         if idx < app.entries.len() {
             app.entries.remove(idx);
@@ -281,8 +325,18 @@ fn delete_current_entry(app: &mut App) {
     calculate_warnings(&mut app.entries);
     app.refresh_filter();
 
-    reset_edit_state(app);
-    app.status = Some("Entry deleted".to_string());
+    app.edit_deleted = true;
+    app.edit_target = None;
+    if let Some(err) = unconfirmed {
+        app.draft_durable = false;
+        app.status = Some(format!(
+            "Deletion written, but verification or durability could not be confirmed: {err:#}. [d] retry confirmation and recovery cleanup"
+        ));
+        return;
+    }
+    if reset_edit_state(app) {
+        app.status = Some("Entry deleted".to_string());
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +364,8 @@ mod tests {
             let path =
                 std::env::temp_dir().join(format!("jaiba-edit-test-{}-{id}", std::process::id()));
             fs::create_dir_all(&path).expect("test directory should be created");
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             Self(path)
         }
 
@@ -325,11 +381,14 @@ mod tests {
     }
 
     fn test_app(database_path: &Path) -> App {
-        let (database, key, entries) = create_database(database_path, TEST_PASSWORD, None)
+        create_database(database_path, TEST_PASSWORD, None)
             .expect("disposable database should be created");
+        let (database, key, entries, revision) =
+            crate::db::unlock_database_snapshot(database_path, TEST_PASSWORD, None).unwrap();
         let mut app = App::for_test(Some(database_path.to_path_buf()));
         app.kdbx = Some(database);
         app.db_key = Some(key);
+        app.primary_revision = Some(revision);
         app.entries = entries;
         app
     }
@@ -380,7 +439,8 @@ mod tests {
         handle_edit_input(app, KeyCode::Char('y'));
         assert!(
             matches!(app.screen, Screen::Index),
-            "edit screen should close"
+            "edit screen should close: {:?}",
+            app.status
         );
     }
 

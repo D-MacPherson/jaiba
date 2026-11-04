@@ -1133,11 +1133,15 @@ dependencies = [
  "crossterm",
  "csv",
  "keepass",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "signal-hook",
  "toml",
  "unicode-width",
+ "zeroize",
 ]
 
 [[package]]

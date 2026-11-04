@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,6 +11,29 @@ use anyhow::Context;
 use chrono::Utc;
 use keepass::db::{EntryId, EntryMut, EntryRef, Times, fields};
 use keepass::{Database, DatabaseKey};
+use sha2::{Digest, Sha256};
+
+/// Exact authenticated ciphertext, not a normalized in-memory serialization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Revision {
+    path: PathBuf,
+    ciphertext: [u8; 32],
+}
+
+impl Revision {
+    pub fn revalidate(&self, path: &Path) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            path == self.path,
+            "Primary database path changed; authenticate again"
+        );
+        let bytes = fs::read(path)?;
+        anyhow::ensure!(
+            self.ciphertext == <[u8; 32]>::from(Sha256::digest(&bytes)),
+            "Primary database changed since authentication; keep edits and authenticate again"
+        );
+        Ok(())
+    }
+}
 
 fn resolve_totp(e: &EntryRef) -> String {
     if let Some(otp) = e.get_raw_otp_value() {
@@ -88,6 +112,18 @@ pub struct Entry {
     pub duplicate_user_count: u32,
 }
 
+impl zeroize::Zeroize for Entry {
+    fn zeroize(&mut self) {
+        self.name.zeroize();
+        self.user.zeroize();
+        self.password.zeroize();
+        self.url.zeroize();
+        self.totp.zeroize();
+        self.notes.zeroize();
+        self.date_last_modify.zeroize();
+    }
+}
+
 fn format_days_ago(dt: chrono::NaiveDateTime) -> String {
     let days = (Utc::now().naive_utc() - dt).num_days();
 
@@ -103,13 +139,24 @@ pub fn unlock_database(
     password: &str,
     keyfile_path: Option<&Path>,
 ) -> anyhow::Result<(Database, DatabaseKey, Vec<Entry>)> {
-    let mut file =
-        fs::File::open(path).with_context(|| format!("couldn't open {}", path.display()))?;
+    let (db, key, entries, _) = unlock_database_snapshot(path, password, keyfile_path)?;
+    Ok((db, key, entries))
+}
+
+pub fn unlock_database_snapshot(
+    path: &Path,
+    password: &str,
+    keyfile_path: Option<&Path>,
+) -> anyhow::Result<(Database, DatabaseKey, Vec<Entry>, Revision)> {
+    let path = fs::canonicalize(path)?;
+    let bytes = fs::read(&path).with_context(|| format!("couldn't open {}", path.display()))?;
 
     let key = build_database_key(password, keyfile_path)?;
-    let db = Database::open(&mut file, key.clone()).map_err(|err| match keyfile_path {
-        Some(_) => anyhow::anyhow!("unlock failed with password + keyfile: {err}"),
-        None => anyhow::anyhow!("unlock failed with password: {err}"),
+    let db = Database::open(&mut std::io::Cursor::new(&bytes), key.clone()).map_err(|err| {
+        match keyfile_path {
+            Some(_) => anyhow::anyhow!("unlock failed with password + keyfile: {err}"),
+            None => anyhow::anyhow!("unlock failed with password: {err}"),
+        }
     })?;
 
     let entries = db
@@ -136,7 +183,13 @@ pub fn unlock_database(
         })
         .collect();
 
-    Ok((db, key, entries))
+    #[cfg(test)]
+    test_fault::after_unlock(&path)?;
+    let revision = Revision {
+        path,
+        ciphertext: Sha256::digest(&bytes).into(),
+    };
+    Ok((db, key, entries, revision))
 }
 
 pub fn create_database(
@@ -194,6 +247,16 @@ pub fn save_database(
     db: &mut Database,
     entries: &mut [Entry],
 ) -> Result<(), SaveError> {
+    save_database_with_revision(path, key, db, entries, &mut None)
+}
+
+pub fn save_database_with_revision(
+    path: &Path,
+    key: &DatabaseKey,
+    db: &mut Database,
+    entries: &mut [Entry],
+    revision: &mut Option<Revision>,
+) -> Result<(), SaveError> {
     // Stage changes separately: a failed write must not leak into a later save.
     let mut candidate = db.clone();
     let mut pending = entries.to_vec();
@@ -201,7 +264,13 @@ pub fn save_database(
         write_entry(&mut candidate, entry).map_err(SaveError::Write)?;
     }
 
-    let result = write_checked(path, key, &candidate, &pending);
+    let result = write_checked_receipt(
+        path,
+        key,
+        &candidate,
+        |saved| verify_saved_entries(saved, key, &pending),
+        revision,
+    );
     if !matches!(result, Err(SaveError::Write(_))) {
         // A verification/durability error happens after replacement. Retain the
         // assigned IDs so retrying updates that entry instead of adding another.
@@ -285,6 +354,16 @@ fn write_checked_with(
     db: &Database,
     verify: impl Fn(&Path) -> anyhow::Result<()>,
 ) -> Result<(), SaveError> {
+    write_checked_receipt(path, key, db, verify, &mut None)
+}
+
+fn write_checked_receipt(
+    path: &Path,
+    key: &DatabaseKey,
+    db: &Database,
+    verify: impl Fn(&Path) -> anyhow::Result<()>,
+    revision: &mut Option<Revision>,
+) -> Result<(), SaveError> {
     let (tmp_path, mut file) = create_staging_file(path).map_err(SaveError::Write)?;
     let result = (|| -> Result<(), SaveError> {
         db.save(&mut file, key.clone())
@@ -296,9 +375,21 @@ fn write_checked_with(
         verify(&tmp_path)
             .context("staged save could not be verified")
             .map_err(SaveError::Write)?;
+        // Hash our staged descriptor, never a later read of the mutable primary.
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| SaveError::Write(e.into()))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|e| SaveError::Write(e.into()))?;
+        let receipt = Revision {
+            path: path.to_owned(),
+            ciphertext: Sha256::digest(&bytes).into(),
+        };
         fs::rename(&tmp_path, path)
             .context("couldn't replace database")
             .map_err(SaveError::Write)?;
+        // Preserve the receipt even if final verification/durability fails.
+        *revision = Some(receipt);
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -307,6 +398,8 @@ fn write_checked_with(
             .and_then(|dir| dir.sync_all())
             .context("database replaced, but directory flush failed")
             .map_err(SaveError::Verification)?;
+        #[cfg(test)]
+        test_fault::after_replace(path).map_err(SaveError::Verification)?;
         verify(path).map_err(SaveError::Verification)
     })();
     // Remove only the unique file that this operation created.
@@ -326,6 +419,7 @@ fn create_staging_file(path: &Path) -> anyhow::Result<(PathBuf, fs::File)> {
         ));
         let candidate = PathBuf::from(name);
         match OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .mode(0o600)
@@ -358,23 +452,38 @@ fn write_entry(db: &mut Database, entry: &mut Entry) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn delete_entry(
     path: &Path,
     key: &DatabaseKey,
     db: &mut Database,
     id: EntryId,
 ) -> anyhow::Result<()> {
+    delete_entry_with_revision(path, key, db, id, &mut None).map_err(anyhow::Error::new)
+}
+
+pub fn delete_entry_with_revision(
+    path: &Path,
+    key: &DatabaseKey,
+    db: &mut Database,
+    id: EntryId,
+    revision: &mut Option<Revision>,
+) -> Result<(), SaveError> {
     let mut candidate = db.clone();
     if let Some(entry) = candidate.entry_mut(id) {
         entry.remove();
     }
-    let result = write_checked_with(path, key, &candidate, |saved| {
-        verify_entry_absent(saved, key, id)
-    });
+    let result = write_checked_receipt(
+        path,
+        key,
+        &candidate,
+        |saved| verify_entry_absent(saved, key, id),
+        revision,
+    );
     if !matches!(result, Err(SaveError::Write(_))) {
         *db = candidate;
     }
-    result.map_err(anyhow::Error::new)
+    result
 }
 
 fn verify_entry_absent(path: &Path, key: &DatabaseKey, id: EntryId) -> anyhow::Result<()> {
@@ -452,6 +561,37 @@ impl std::fmt::Display for SaveError {
             SaveError::Write(err) => write!(f, "{err:#}"),
             SaveError::Verification(err) => write!(f, "{err:#}"),
         }
+    }
+}
+
+// Synthetic per-thread fault injection; absent from release builds and never
+// controlled by environment variables or user input.
+#[cfg(test)]
+pub mod test_fault {
+    use std::{cell::RefCell, path::Path};
+    pub enum FinalCheck {
+        Fail,
+        Replace(Vec<u8>),
+    }
+    thread_local! {
+        pub static FINAL: RefCell<Option<FinalCheck>> = const { RefCell::new(None) };
+        pub static UNLOCK: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    }
+    pub fn after_replace(path: &Path) -> anyhow::Result<()> {
+        match FINAL.with(|next| next.borrow_mut().take()) {
+            None => Ok(()),
+            Some(FinalCheck::Fail) => anyhow::bail!("synthetic final verification failure"),
+            Some(FinalCheck::Replace(bytes)) => {
+                std::fs::write(path, bytes)?;
+                anyhow::bail!("synthetic external replacement before final verification")
+            }
+        }
+    }
+    pub fn after_unlock(path: &Path) -> anyhow::Result<()> {
+        if let Some(bytes) = UNLOCK.with(|next| next.borrow_mut().take()) {
+            std::fs::write(path, bytes)?;
+        }
+        Ok(())
     }
 }
 

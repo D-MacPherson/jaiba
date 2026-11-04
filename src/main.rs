@@ -5,6 +5,11 @@ mod db;
 mod export;
 mod import;
 mod input;
+mod locking;
+mod private_fs;
+#[cfg(test)]
+mod r4_review_tests;
+mod recovery;
 mod terminal_clipboard;
 mod theme;
 mod ui;
