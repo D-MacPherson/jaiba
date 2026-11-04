@@ -5,7 +5,9 @@ use crossterm::event::KeyCode;
 
 use crate::app::{App, ExportStep, ImportStep, PasswordChangeStep, Screen};
 use crate::config::save_config;
-use crate::db::{Entry, build_database_key, calculate_warnings, save_database, unlock_database};
+use crate::db::{
+    Entry, SaveError, build_database_key, calculate_warnings, save_database, unlock_database,
+};
 use crate::theme::load_theme;
 use crate::util::expand_tilde;
 
@@ -330,6 +332,12 @@ fn commit_password_change(app: &mut App) {
             app.db_key = Some(new_key);
             "master password changed".to_string()
         }
+        Err(SaveError::Verification(err)) => {
+            // Replacement has happened even though final confirmation failed.
+            // Further saves must use the new key, never silently revert it.
+            app.db_key = Some(new_key);
+            format!("password change written, but could not be confirmed: {err:#}")
+        }
         Err(err) => format!("couldn't change password: {err:#}"),
     });
 
@@ -451,14 +459,11 @@ fn confirm_import_kdbx_password(app: &mut App) {
 
 fn finish_import(app: &mut App, imported: Vec<Entry>, source: &Path) {
     let count = imported.len();
-
+    let mut pending = app.entries.clone();
     for mut entry in imported {
         entry.id = None;
-        app.entries.push(entry);
+        pending.push(entry);
     }
-
-    calculate_warnings(&mut app.entries);
-    app.refresh_filter();
 
     let (Some(path), Some(key), Some(db)) = (
         app.config.default_database.clone(),
@@ -466,16 +471,28 @@ fn finish_import(app: &mut App, imported: Vec<Entry>, source: &Path) {
         app.kdbx.as_mut(),
     ) else {
         app.status = Some(format!(
-            "imported {count} entries from {}, but couldn't save: database is locked",
+            "Not imported: database is locked ({})",
             source.display()
         ));
         reset_import_state(app);
         return;
     };
 
-    app.status = Some(match save_database(&path, &key, db, &mut app.entries) {
-        Ok(()) => format!("imported {count} entries from {}", source.display()),
-        Err(err) => format!("imported {count} entries, but failed to save: {err:#}"),
+    let result = save_database(&path, &key, db, &mut pending);
+    if !matches!(result, Err(SaveError::Write(_))) {
+        app.entries = pending;
+        calculate_warnings(&mut app.entries);
+        app.refresh_filter();
+    }
+    app.status = Some(match result {
+        Ok(()) => format!(
+            "imported and verified {count} entries from {}",
+            source.display()
+        ),
+        Err(SaveError::Write(err)) => format!("Not imported: {err:#}"),
+        Err(SaveError::Verification(err)) => {
+            format!("Import written, but could not be confirmed: {err:#}")
+        }
     });
 
     reset_import_state(app);
@@ -582,7 +599,7 @@ fn do_export(app: &mut App) {
 
     let count = app.entries.len();
 
-    let result = match format {
+    let result: anyhow::Result<()> = match format {
         crate::export::ExportFormat::Kdbx => {
             let (Some(key), Some(db)) = (app.db_key.clone(), app.kdbx.as_mut()) else {
                 app.status = Some("no unlocked database".to_string());
@@ -590,7 +607,7 @@ fn do_export(app: &mut App) {
                 return;
             };
 
-            save_database(&path, &key, db, &mut app.entries)
+            save_database(&path, &key, db, &mut app.entries).map_err(|err| anyhow::anyhow!("{err}"))
         }
         crate::export::ExportFormat::Csv => crate::export::export_csv(&path, &app.entries),
         crate::export::ExportFormat::Json => crate::export::export_json(&path, &app.entries),
@@ -692,5 +709,56 @@ fn apply_selected_theme(app: &mut App) {
         Err(err) => {
             app.status = Some(format!("couldn't load theme \"{name}\": {err}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::*;
+    use crate::db::create_database;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn failed_import_is_not_silently_written_by_a_later_save() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "jaiba-import-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("import.kdbx");
+        let (db, key, _) = create_database(&path, "test password", None).unwrap();
+        let mut app = App::for_test(Some(dir.join("missing/import.kdbx")));
+        app.kdbx = Some(db);
+        app.db_key = Some(key);
+        finish_import(
+            &mut app,
+            vec![Entry {
+                name: "failed import".into(),
+                password: "synthetic import password".into(),
+                ..Entry::default()
+            }],
+            Path::new("synthetic.json"),
+        );
+        assert!(app.status.as_ref().unwrap().starts_with("Not imported:"));
+        assert!(app.entries.is_empty());
+        app.config.default_database = Some(path.clone());
+        app.entries.push(Entry {
+            name: "later entry".into(),
+            ..Entry::default()
+        });
+        save_database(
+            &path,
+            app.db_key.as_ref().unwrap(),
+            app.kdbx.as_mut().unwrap(),
+            &mut app.entries,
+        )
+        .unwrap();
+        let (_, _, saved) = unlock_database(&path, "test password", None).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "later entry");
+        fs::remove_dir_all(dir).unwrap();
     }
 }

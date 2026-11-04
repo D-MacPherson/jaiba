@@ -5,6 +5,7 @@ mod db;
 mod export;
 mod import;
 mod input;
+mod terminal_clipboard;
 mod theme;
 mod ui;
 mod util;
@@ -16,11 +17,11 @@ fn main() -> io::Result<()> {
 
     let mut terminal = ratatui::init();
 
-    app::run(&mut terminal, slim_mode)?;
+    let result = app::run(&mut terminal, slim_mode);
 
     ratatui::restore();
 
-    Ok(())
+    result
 }
 
 fn handle_cli_flags() -> bool {
@@ -30,7 +31,14 @@ fn handle_cli_flags() -> bool {
         .iter()
         .any(|a| a == "--version" || a == "-V" || a == "-v")
     {
-        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        println!(
+            "{} {}{}",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            option_env!("JAIBA_BUILD_LABEL")
+                .map(|label| format!(" ({label})"))
+                .unwrap_or_default()
+        );
         std::process::exit(0);
     }
 

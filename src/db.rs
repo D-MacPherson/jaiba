@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use chrono::Utc;
@@ -190,28 +193,150 @@ pub fn save_database(
     key: &DatabaseKey,
     db: &mut Database,
     entries: &mut [Entry],
-) -> anyhow::Result<()> {
-    for entry in entries.iter_mut() {
-        write_entry(db, entry)?;
+) -> Result<(), SaveError> {
+    // Stage changes separately: a failed write must not leak into a later save.
+    let mut candidate = db.clone();
+    let mut pending = entries.to_vec();
+    for entry in &mut pending {
+        write_entry(&mut candidate, entry).map_err(SaveError::Write)?;
     }
 
-    write_to_disk(path, key, db)
+    let result = write_checked(path, key, &candidate, &pending);
+    if !matches!(result, Err(SaveError::Write(_))) {
+        // A verification/durability error happens after replacement. Retain the
+        // assigned IDs so retrying updates that entry instead of adding another.
+        *db = candidate;
+        entries.clone_from_slice(&pending);
+    }
+    result
+}
+
+/// Individually reopen the vault from disk and confirm every entry we just
+/// wrote is present with the fields we asked for.
+///
+/// This is deliberately an independent read: it re-decrypts the file the user
+/// will actually keep, instead of trusting the in-memory `Database`.
+fn verify_saved_entries(path: &Path, key: &DatabaseKey, entries: &[Entry]) -> anyhow::Result<()> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("couldn't reopen {} to verify the save", path.display()))?;
+
+    let reopened = Database::open(&mut file, key.clone())
+        .map_err(|err| anyhow::anyhow!("couldn't decrypt the saved database: {err}"))?;
+
+    for entry in entries {
+        let id = entry.id.context("saved entry has no ID")?;
+
+        let saved = reopened.entry(id).ok_or_else(|| {
+            anyhow::anyhow!("the saved database doesn't contain the entry that was written")
+        })?;
+
+        for (field, expected_value) in persisted_fields(entry) {
+            let actual = saved.get(field).unwrap_or_default();
+
+            // Unprotected whitespace-only values are normalized to empty by
+            // keepass's XML reader. Passwords are protected and compared exactly.
+            let expected_value = if field != fields::PASSWORD && expected_value.trim().is_empty() {
+                ""
+            } else {
+                expected_value
+            };
+            if actual != expected_value {
+                anyhow::bail!(
+                    "the saved entry doesn't match what was written: field \"{field}\" differs"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The field/value pairs that must survive a save, paired with their
+/// user-facing names for the mismatch message.
+fn persisted_fields(entry: &Entry) -> [(&'static str, &str); 6] {
+    [
+        (fields::TITLE, entry.name.as_str()),
+        (fields::USERNAME, entry.user.as_str()),
+        (fields::PASSWORD, entry.password.as_str()),
+        (fields::URL, entry.url.as_str()),
+        (fields::OTP, entry.totp.as_str()),
+        (fields::NOTES, entry.notes.as_str()),
+    ]
 }
 
 fn write_to_disk(path: &Path, key: &DatabaseKey, db: &Database) -> anyhow::Result<()> {
-    let tmp_path = sibling_tmp_path(path);
+    write_checked(path, key, db, &[]).map_err(anyhow::Error::new)
+}
 
-    {
-        let mut file = fs::File::create(&tmp_path)
-            .with_context(|| format!("couldn't create {}", tmp_path.display()))?;
+fn write_checked(
+    path: &Path,
+    key: &DatabaseKey,
+    db: &Database,
+    entries: &[Entry],
+) -> Result<(), SaveError> {
+    write_checked_with(path, key, db, |candidate| {
+        verify_saved_entries(candidate, key, entries)
+    })
+}
 
+fn write_checked_with(
+    path: &Path,
+    key: &DatabaseKey,
+    db: &Database,
+    verify: impl Fn(&Path) -> anyhow::Result<()>,
+) -> Result<(), SaveError> {
+    let (tmp_path, mut file) = create_staging_file(path).map_err(SaveError::Write)?;
+    let result = (|| -> Result<(), SaveError> {
         db.save(&mut file, key.clone())
-            .map_err(|err| anyhow::anyhow!("failed to write database: {err}"))?;
+            .map_err(|err| SaveError::Write(anyhow::anyhow!("failed to write database: {err}")))?;
+        file.sync_all()
+            .context("couldn't flush staged database")
+            .map_err(SaveError::Write)?;
+        // Reject unreadable or mismatched data before replacing the good file.
+        verify(&tmp_path)
+            .context("staged save could not be verified")
+            .map_err(SaveError::Write)?;
+        fs::rename(&tmp_path, path)
+            .context("couldn't replace database")
+            .map_err(SaveError::Write)?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .context("database replaced, but directory flush failed")
+            .map_err(SaveError::Verification)?;
+        verify(path).map_err(SaveError::Verification)
+    })();
+    // Remove only the unique file that this operation created.
+    drop(file);
+    let _ = fs::remove_file(&tmp_path);
+    result
+}
+
+fn create_staging_file(path: &Path) -> anyhow::Result<(PathBuf, fs::File)> {
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..100 {
+        let mut name: OsString = path.as_os_str().to_owned();
+        name.push(format!(
+            ".jaiba-{}-{}.tmp",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let candidate = PathBuf::from(name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err).context("couldn't create staged database"),
+        }
     }
-
-    fs::rename(&tmp_path, path).with_context(|| format!("couldn't replace {}", path.display()))?;
-
-    Ok(())
+    anyhow::bail!("couldn't allocate a unique staged database")
 }
 
 fn write_entry(db: &mut Database, entry: &mut Entry) -> anyhow::Result<()> {
@@ -239,11 +364,31 @@ pub fn delete_entry(
     db: &mut Database,
     id: EntryId,
 ) -> anyhow::Result<()> {
-    db.entry_mut(id)
-        .context("entry no longer exists in the database")?
-        .remove();
+    let mut candidate = db.clone();
+    if let Some(entry) = candidate.entry_mut(id) {
+        entry.remove();
+    }
+    let result = write_checked_with(path, key, &candidate, |saved| {
+        verify_entry_absent(saved, key, id)
+    });
+    if !matches!(result, Err(SaveError::Write(_))) {
+        *db = candidate;
+    }
+    result.map_err(anyhow::Error::new)
+}
 
-    write_to_disk(path, key, db)
+fn verify_entry_absent(path: &Path, key: &DatabaseKey, id: EntryId) -> anyhow::Result<()> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("couldn't reopen {} to verify the delete", path.display()))?;
+
+    let reopened = Database::open(&mut file, key.clone())
+        .map_err(|err| anyhow::anyhow!("couldn't decrypt the saved database: {err}"))?;
+
+    if reopened.entry(id).is_some() {
+        anyhow::bail!("the deleted entry is still present in the saved database");
+    }
+
+    Ok(())
 }
 
 fn apply_fields(e: &mut EntryMut<'_>, entry: &Entry) {
@@ -254,12 +399,6 @@ fn apply_fields(e: &mut EntryMut<'_>, entry: &Entry) {
     e.set_unprotected(fields::OTP, entry.totp.clone());
     e.set_unprotected(fields::NOTES, entry.notes.clone());
     e.times.last_modification = Some(Times::now());
-}
-
-fn sibling_tmp_path(path: &Path) -> PathBuf {
-    let mut name: OsString = path.as_os_str().to_owned();
-    name.push(".tmp");
-    PathBuf::from(name)
 }
 
 pub fn calculate_warnings(entries: &mut Vec<Entry>) {
@@ -291,9 +430,36 @@ pub fn calculate_warnings(entries: &mut Vec<Entry>) {
     }
 }
 
+/// A write that reached disk but could not be confirmed by re-reading it.
+///
+/// Kept distinct from a write failure so the UI can tell the user whether the
+/// vault was not written at all, or was written but could not be verified.
+#[derive(Debug)]
+pub enum SaveError {
+    /// The vault was not written. The on-disk file is unchanged.
+    Write(anyhow::Error),
+
+    /// The vault was written, but reopening it from disk did not reproduce the
+    /// saved entry's fields.
+    Verification(anyhow::Error),
+}
+
+impl std::error::Error for SaveError {}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SaveError::Write(err) => write!(f, "{err:#}"),
+            SaveError::Verification(err) => write!(f, "{err:#}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_database_key, create_database, save_database, unlock_database};
+    use super::{
+        Entry, SaveError, build_database_key, create_database, save_database, unlock_database,
+    };
     use keepass::db::fields;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -478,5 +644,259 @@ mod tests {
             .to_string();
         assert!(error.contains("password + keyfile"));
         assert!(error.contains("Incorrect key"));
+    }
+
+    fn saved_entry(name: &str) -> Entry {
+        Entry {
+            id: None,
+            name: name.to_string(),
+            user: "tester".to_string(),
+            password: "entry-password".to_string(),
+            url: "https://example.test".to_string(),
+            totp: String::new(),
+            notes: "notes".to_string(),
+            date_last_modify: String::new(),
+            password_reuse_count: 0,
+            duplicate_user_count: 0,
+        }
+    }
+
+    #[test]
+    fn save_database_persists_an_entry_with_a_blank_title() {
+        // Whitespace-only titles must not cause the entry to disappear.
+        let dir = TestDir::new();
+        let database_path = dir.join("blank-title.kdbx");
+        let (mut database, key, mut entries) =
+            create_database(&database_path, "correct horse", None)
+                .expect("database should be created");
+
+        let mut entry = saved_entry("   ");
+        entries.push(std::mem::take(&mut entry));
+
+        save_database(&database_path, &key, &mut database, &mut entries)
+            .expect("an untitled entry should still be written");
+
+        assert!(
+            entries[0].id.is_some(),
+            "the entry should have been assigned an id"
+        );
+
+        let (_, _, reopened) =
+            unlock_database(&database_path, "correct horse", None).expect("database should unlock");
+        assert_eq!(
+            reopened.len(),
+            1,
+            "the untitled entry must be persisted, not silently discarded"
+        );
+        // `keepass` normalizes a blank title to an empty string; the point is
+        // that the entry itself survives rather than vanishing.
+        assert_eq!(reopened[0].name, "");
+    }
+
+    #[test]
+    fn save_database_verifies_the_entry_after_reopening_from_disk() {
+        let dir = TestDir::new();
+        let database_path = dir.join("verified.kdbx");
+        let (mut database, key, mut entries) =
+            create_database(&database_path, "correct horse", None)
+                .expect("database should be created");
+
+        let mut entry = saved_entry("Verified entry");
+        entries.push(std::mem::take(&mut entry));
+
+        save_database(&database_path, &key, &mut database, &mut entries)
+            .expect("database should be saved and verified");
+
+        let id = entries[0].id.expect("saved entry should keep its id");
+        let (_, _, reopened) =
+            unlock_database(&database_path, "correct horse", None).expect("database should unlock");
+        let persisted = reopened
+            .iter()
+            .find(|candidate| candidate.id == Some(id))
+            .expect("the saved entry should be findable by id");
+        assert_eq!(persisted.name, "Verified entry");
+        assert_eq!(persisted.user, "tester");
+        assert_eq!(persisted.url, "https://example.test");
+    }
+
+    #[test]
+    fn save_database_reports_write_failures_separately_from_verification_failures() {
+        let dir = TestDir::new();
+        let database_path = dir.join("write-fails.kdbx");
+        let (mut database, key, mut entries) =
+            create_database(&database_path, "correct horse", None)
+                .expect("database should be created");
+
+        // A directory where the vault file should be makes the final rename
+        // fail: the write phase cannot complete.
+        let blocking_path = dir.join("blocked.kdbx");
+        fs::create_dir(&blocking_path).expect("blocking directory should be created");
+
+        let entry = saved_entry("Blocked entry");
+        entries.push(entry);
+
+        let error = save_database(&blocking_path, &key, &mut database, &mut entries)
+            .expect_err("writing over a directory must fail");
+        assert!(
+            matches!(error, SaveError::Write(_)),
+            "a failed write should be reported as a write failure, got {error:?}"
+        );
+
+        // No temp file should be left behind next to the real vault.
+        let mut leftover = PathBuf::from(&blocking_path);
+        leftover.set_extension("kdbx.tmp");
+        assert!(
+            !leftover.exists(),
+            "a failed write must not leave a temp file"
+        );
+    }
+
+    #[test]
+    fn save_database_reports_verification_failures_when_the_written_file_cannot_be_reopened() {
+        let dir = TestDir::new();
+        let database_path = dir.join("verify-fails.kdbx");
+        let (mut database, key, mut entries) =
+            create_database(&database_path, "correct horse", None)
+                .expect("database should be created");
+
+        let mut entry = saved_entry("Ghost entry");
+        entries.push(std::mem::take(&mut entry));
+
+        // Write and verify in two steps so the second one can be pointed at a
+        // file that no longer opens: this is the "written, but unconfirmed"
+        // case that must not be reported as success.
+        super::write_entry(&mut database, &mut entries[0]).expect("entry should be staged");
+        super::write_to_disk(&database_path, &key, &database).expect("database should be written");
+
+        fs::write(&database_path, b"not a kdbx file").expect("corrupt file should be written");
+
+        let error = super::verify_saved_entries(&database_path, &key, &entries)
+            .expect_err("an unreadable vault must fail verification");
+        assert!(
+            error.to_string().contains("couldn't decrypt"),
+            "verification should explain why it failed, got: {error}"
+        );
+
+        let mapped: SaveError = SaveError::Verification(error);
+        assert!(
+            !matches!(mapped, SaveError::Write(_)),
+            "an unreadable written file is a verification failure"
+        );
+    }
+
+    #[test]
+    fn verification_detects_a_field_that_did_not_persist() {
+        let dir = TestDir::new();
+        let database_path = dir.join("mismatch.kdbx");
+        let (mut database, key, mut entries) =
+            create_database(&database_path, "correct horse", None)
+                .expect("database should be created");
+
+        let mut entry = saved_entry("Persisted name");
+        entries.push(std::mem::take(&mut entry));
+
+        super::write_entry(&mut database, &mut entries[0]).expect("entry should be staged");
+        super::write_to_disk(&database_path, &key, &database).expect("database should be written");
+
+        // The caller now believes a different value was saved. Verification
+        // must compare against what is actually on disk.
+        entries[0].notes = "a value that never reached disk".to_string();
+
+        let error = super::verify_saved_entries(&database_path, &key, &entries)
+            .expect_err("a field mismatch must fail verification");
+        assert!(
+            error.to_string().contains("Notes"),
+            "the mismatch should name the field, got: {error}"
+        );
+    }
+
+    #[test]
+    fn rejected_staging_preserves_original_and_removes_only_its_own_file() {
+        let dir = TestDir::new();
+        let path = dir.join("original.kdbx");
+        let (db, key, _) = create_database(&path, "test password", None).unwrap();
+        let original = fs::read(&path).unwrap();
+        let sentinel = dir.join("original.kdbx.tmp");
+        fs::write(&sentinel, b"unrelated file").unwrap();
+        let err = super::write_checked_with(&path, &key, &db, |_| {
+            anyhow::bail!("injected verification failure")
+        })
+        .unwrap_err();
+        assert!(matches!(err, SaveError::Write(_)));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"unrelated file");
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn final_verification_failure_reports_that_replacement_already_happened() {
+        let dir = TestDir::new();
+        let path = dir.join("replaced.kdbx");
+        let (mut db, key, _) = create_database(&path, "test password", None).unwrap();
+        let mut entry = saved_entry("replacement");
+        super::write_entry(&mut db, &mut entry).unwrap();
+        let err = super::write_checked_with(&path, &key, &db, |candidate| {
+            if candidate == path {
+                anyhow::bail!("injected final verification failure");
+            }
+            super::verify_saved_entries(candidate, &key, std::slice::from_ref(&entry))
+        })
+        .unwrap_err();
+        assert!(matches!(err, SaveError::Verification(_)));
+        let (_, _, entries) = unlock_database(&path, "test password", None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "replacement");
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn saved_database_has_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new();
+        let path = dir.join("private.kdbx");
+        let (mut db, key, mut entries) = create_database(&path, "test password", None).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        entries.push(saved_entry("private entry"));
+        save_database(&path, &key, &mut db, &mut entries).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn failed_rename_does_not_mutate_database_or_assign_entry_id() {
+        let dir = TestDir::new();
+        let path = dir.join("source.kdbx");
+        let (mut db, key, mut entries) = create_database(&path, "test password", None).unwrap();
+        let original = db.clone();
+        let blocked = dir.join("blocked.kdbx");
+        fs::create_dir(&blocked).unwrap();
+        entries.push(saved_entry("should not leak"));
+        assert!(save_database(&blocked, &key, &mut db, &mut entries).is_err());
+        assert_eq!(db, original);
+        assert!(entries[0].id.is_none());
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn deletion_can_be_retried_after_a_failed_write() {
+        let dir = TestDir::new();
+        let path = dir.join("delete.kdbx");
+        let (mut db, key, mut entries) = create_database(&path, "test password", None).unwrap();
+        entries.push(saved_entry("delete me"));
+        save_database(&path, &key, &mut db, &mut entries).unwrap();
+        let id = entries[0].id.unwrap();
+        let blocked = dir.join("missing/delete.kdbx");
+        assert!(super::delete_entry(&blocked, &key, &mut db, id).is_err());
+        assert!(db.entry(id).is_some());
+        super::delete_entry(&path, &key, &mut db, id).unwrap();
+        super::delete_entry(&path, &key, &mut db, id).unwrap();
+        assert!(
+            unlock_database(&path, "test password", None)
+                .unwrap()
+                .2
+                .is_empty()
+        );
     }
 }

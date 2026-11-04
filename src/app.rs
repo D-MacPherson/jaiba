@@ -25,6 +25,7 @@ use crate::ui::index::draw_index;
 use crate::ui::login::draw_login;
 use crate::ui::settings::draw_settings;
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum Screen {
     Login,
     Index,
@@ -106,6 +107,7 @@ pub struct App {
     pub status: Option<String>,
 
     pub clipboard: Option<Clipboard>,
+    pub terminal_clipboard: bool,
 
     pub clipboard_timer: Option<ClipboardTimer>,
 
@@ -114,6 +116,65 @@ pub struct App {
 }
 
 impl App {
+    /// A clipboard-free `App` for tests: no terminal, no system clipboard.
+    #[cfg(test)]
+    pub fn for_test(database_path: Option<PathBuf>) -> Self {
+        Self {
+            screen: Screen::Index,
+            password: String::new(),
+            query: String::new(),
+            max_len: 0,
+            index_state: TableState::default().with_selected(Some(0)),
+            edit_state: ListState::default(),
+            reveal_password: false,
+            edit_entry: None,
+            edit_original: None,
+            edit_target: None,
+            editing_field: false,
+            field_buffer: String::new(),
+            confirm_delete: false,
+            confirm_exit: false,
+            entries: Vec::new(),
+            filtered: Vec::new(),
+            kdbx: None,
+            db_key: None,
+            theme: Theme::default(),
+            config: Config {
+                default_database: database_path,
+                ..Config::default()
+            },
+            creating_database: false,
+            confirming_new_db_password: false,
+            new_db_confirm: String::new(),
+            available_themes: Vec::new(),
+            settings_state: ListState::default(),
+            choosing_theme: false,
+            theme_state: ListState::default(),
+            changing_password: false,
+            password_change_step: PasswordChangeStep::CurrentPassword,
+            current_password_buffer: String::new(),
+            new_password_buffer: String::new(),
+            new_password_confirm: String::new(),
+            importing_database: false,
+            import_step: ImportStep::Path,
+            import_path_buffer: String::new(),
+            import_kdbx_password_buffer: String::new(),
+            pending_import_path: None,
+            exporting_database: false,
+            export_step: ExportStep::Path,
+            export_path_buffer: String::new(),
+            pending_export_path: None,
+            login_error: None,
+            last_activity: Instant::now(),
+            status: None,
+            clipboard: None,
+            terminal_clipboard: false,
+            clipboard_timer: None,
+            should_quit: false,
+            slim_mode: false,
+        }
+    }
+
     fn compute_filtered(&self) -> Vec<usize> {
         let query = self.query.to_lowercase();
 
@@ -209,6 +270,8 @@ pub fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     slim_mode: bool,
 ) -> io::Result<()> {
+    let terminal_clipboard =
+        crate::terminal_clipboard::enabled(std::env::var_os("JAIBA_CLIPBOARD_BACKEND").as_deref())?;
     let _ = crate::theme::ensure_default_themes();
 
     let mut config = load_config().unwrap_or_default();
@@ -268,7 +331,12 @@ pub fn run(
         confirming_new_db_password: false,
         new_db_confirm: String::new(),
         status: None,
-        clipboard: Clipboard::new().ok(),
+        clipboard: if terminal_clipboard {
+            None
+        } else {
+            Clipboard::new().ok()
+        },
+        terminal_clipboard,
         clipboard_timer: None,
         should_quit: false,
         slim_mode,

@@ -3,6 +3,7 @@ use std::time::Instant;
 use arboard::Clipboard;
 
 use crate::app::App;
+use crate::terminal_clipboard;
 
 pub struct ClipboardTimer {
     pub label: String,
@@ -11,6 +12,15 @@ pub struct ClipboardTimer {
 }
 
 fn copy_and_report(app: &mut App, label: &str, text: &str) {
+    if app.terminal_clipboard {
+        // A write-only backend cannot implement read/compare/clear safely.
+        app.clipboard_timer = None;
+        app.status = Some(match terminal_clipboard::copy(text) {
+            Ok(()) => format!("Copied {label}; automatic clipboard expiration is disabled"),
+            Err(err) => format!("Failed to copy {label}: {err}"),
+        });
+        return;
+    }
     let result = match app.clipboard.as_mut() {
         Some(clipboard) => clipboard.set_text(text),
         None => match Clipboard::new() {
