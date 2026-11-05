@@ -26,6 +26,18 @@ pub fn detect_format(path: &Path) -> anyhow::Result<ImportFormat> {
     }
 }
 
+#[cfg(test)]
+#[path = "kdbx_test_fixtures.rs"]
+mod kdbx_test_fixtures;
+
+#[cfg(test)]
+#[path = "kdbx_header_tests.rs"]
+mod kdbx_header_tests;
+
+#[cfg(test)]
+#[path = "kdbx_import_tests.rs"]
+mod kdbx_import_tests;
+
 pub fn import_kdbx(path: &Path, password: &str) -> anyhow::Result<Vec<Entry>> {
     let (_, _, entries) = unlock_database(path, password, None)?;
     Ok(entries)

@@ -4,15 +4,19 @@ use crossterm::event::KeyCode;
 
 use crate::app::{App, Screen};
 use crate::config::save_config;
-use crate::db::{calculate_warnings, create_database, unlock_database_snapshot};
+use crate::db::{
+    calculate_warnings, create_database_with_yubikey, unlock_database_snapshot_with_yubikey,
+};
 use crate::util::default_new_database_path;
 
+#[cfg(test)]
+#[path = "login_cancellation_tests.rs"]
+mod cancellation_tests;
+
 pub fn handle_login_input(app: &mut App, key: KeyCode) {
-    if key == KeyCode::Esc && app.pending_draft.is_some() {
-        app.login_error = Some(
-            "Draft only in memory. KEEP THIS WINDOW OPEN; authenticate, then save or discard."
-                .into(),
-        );
+    if (key == KeyCode::Esc || app.creating_database || database_missing(app))
+        && app.protect_memory_draft()
+    {
         return;
     }
     if app.creating_database {
@@ -155,19 +159,39 @@ fn finish_create_database(app: &mut App) {
         return;
     }
 
-    match create_database(&path, &app.password, app.config.keyfile.as_deref())
-        .and_then(|_| unlock_database_snapshot(&path, &app.password, app.config.keyfile.as_deref()))
-    {
+    let yubikey = app.config.yubikey;
+    match create_database_with_yubikey(&path, &app.password, app.config.keyfile.as_deref(), yubikey)
+        .and_then(|_| {
+            unlock_database_snapshot_with_yubikey(
+                &path,
+                &app.password,
+                app.config.keyfile.as_deref(),
+                yubikey,
+            )
+            .map_err(|err| anyhow::Error::new(crate::db::SaveError::Verification(err)))
+        }) {
         Ok((db, key, entries, revision)) => {
             app.config.default_database = Some(path.clone());
             let save_result = save_config(&app.config);
+            #[cfg(test)]
+            cancellation_tests::checkpoint("create_ready");
+            if authentication_cancelled(app) {
+                app.login_error = Some(format!(
+                    "Database created at {}, but authentication cancelled; keep the file and authenticate again with all factors.",
+                    path.display()
+                ));
+                return;
+            }
 
             app.kdbx = Some(db);
             app.db_key = Some(key);
+            #[cfg(test)]
+            cancellation_tests::checkpoint("installing");
             app.primary_revision = Some(revision);
             app.entries = entries;
             app.open_database = Some(path.clone());
             app.open_keyfile = app.config.keyfile.clone();
+            app.open_yubikey = yubikey;
             app.password.clear();
             app.new_db_confirm.clear();
             app.creating_database = false;
@@ -175,6 +199,9 @@ fn finish_create_database(app: &mut App) {
             app.login_error = None;
             app.last_activity = Instant::now();
             app.refresh_filter();
+            if authentication_cancelled(app) {
+                return;
+            }
             app.screen = Screen::Index;
 
             app.status = Some(match save_result {
@@ -184,12 +211,42 @@ fn finish_create_database(app: &mut App) {
         }
 
         Err(err) => {
-            app.login_error = Some(format!("Couldn't create database: {err:#}"));
+            let committed = matches!(
+                err.downcast_ref::<crate::db::SaveError>(),
+                Some(crate::db::SaveError::Verification(_))
+            );
+            app.login_error = Some(if committed {
+                app.config.default_database = Some(path.clone());
+                app.creating_database = false;
+                format!(
+                    "Database created at {}, but not verified. Keep the file; authenticate with all factors to confirm before using it: {err:#}",
+                    path.display()
+                )
+            } else {
+                format!("Couldn't create database: {err:#}")
+            });
             app.password.clear();
             app.new_db_confirm.clear();
             app.confirming_new_db_password = false;
         }
     }
+}
+
+/// Cooperative checkpoints, not an atomic signal/installation transaction.
+/// Signals after the last checkpoint remain for the event-loop coordinator.
+fn authentication_cancelled(app: &mut App) -> bool {
+    if let Err(err) = challenge_response::operation::check() {
+        // No persistence/recovery here: revoke partial installation and leave the
+        // signal flag for the normal lock coordinator. Returned keys drop on return.
+        // Unlike failed recovery, cancellation before recovery does not invalidate
+        // an existing durability receipt; the coordinator still revalidates it.
+        let durable = app.draft_durable;
+        app.hide_failed_recovery();
+        app.draft_durable = durable;
+        app.login_error = Some(format!("Authentication cancelled: {err}"));
+        return true;
+    }
+    false
 }
 
 fn attempt_unlock(app: &mut App) {
@@ -203,20 +260,39 @@ fn attempt_unlock(app: &mut App) {
     } else {
         app.config.keyfile.clone()
     };
-    match unlock_database_snapshot(&path, &app.password, keyfile.as_deref()) {
+    let yubikey = app.database_yubikey();
+    match unlock_database_snapshot_with_yubikey(&path, &app.password, keyfile.as_deref(), yubikey) {
         Ok((db, key, mut entries, revision)) => {
             calculate_warnings(&mut entries);
+            #[cfg(test)]
+            cancellation_tests::checkpoint("unlock_ready");
+            if authentication_cancelled(app) {
+                return;
+            }
             app.entries = entries;
             app.kdbx = Some(db);
             app.db_key = Some(key);
+            #[cfg(test)]
+            cancellation_tests::checkpoint("installing");
             app.primary_revision = Some(revision);
             app.open_database = Some(path);
             app.open_keyfile = keyfile;
+            app.open_yubikey = yubikey;
             app.password.clear();
             app.login_error = None;
             app.last_activity = Instant::now();
             app.refresh_filter();
+            if authentication_cancelled(app) {
+                return;
+            }
             app.screen = Screen::Index;
+            #[cfg(test)]
+            cancellation_tests::checkpoint("before_recovery");
+            if authentication_cancelled(app) {
+                return;
+            }
+            #[cfg(test)]
+            cancellation_tests::checkpoint("recover_started");
             if let Err(err) = crate::recovery::recover(app) {
                 app.hide_failed_recovery();
                 app.login_error = Some(format!("Recovery failed; keep recovery files: {err}"));
@@ -224,7 +300,7 @@ fn attempt_unlock(app: &mut App) {
         }
         Err(err) => {
             app.password.clear();
-            app.login_error = Some(format!("{err}"));
+            app.login_error = Some(format!("{err:#}"));
         }
     }
 }

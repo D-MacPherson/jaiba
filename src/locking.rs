@@ -97,6 +97,7 @@ pub struct Registration {
     seen: HashSet<String>,
     flag: Arc<AtomicBool>,
     signal: signal_hook::SigId,
+    _cancellation: challenge_response::operation::Cancellation,
 }
 
 impl Registration {
@@ -110,7 +111,7 @@ impl Registration {
         Self::register(Path::new(RUNTIME), VAULT_UID).map(Some)
     }
     #[cfg(test)]
-    fn for_test(root: &Path) -> io::Result<Self> {
+    pub(crate) fn for_test(root: &Path) -> io::Result<Self> {
         Self::register(root, crate::private_fs::uid())
     }
 
@@ -176,13 +177,18 @@ impl Registration {
             ack,
             ack_file: None,
             seen,
-            flag,
+            flag: Arc::clone(&flag),
             signal,
+            _cancellation: challenge_response::operation::Cancellation::install(Arc::clone(&flag)),
         })
     }
 
     /// The signal handler does only an atomic store. All filesystem I/O, KDBX
     /// encryption and UI transitions happen here, on the normal event loop.
+    pub fn pending(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
     pub fn process(&mut self, app: &mut App) -> io::Result<()> {
         if !self.flag.swap(false, Ordering::SeqCst) {
             return Ok(());
@@ -191,21 +197,39 @@ impl Registration {
         if !self.seen.insert(value.clone()) {
             return Ok(());
         }
-        let durable = app.lock_cooperatively();
+        // A valid request revokes access first. New hardware-dependent draft
+        // persistence cannot wait for more touches under the controller deadline.
+        let durable = if app.database_yubikey().is_some() {
+            let _cancel = challenge_response::operation::Cancellation::install(Arc::new(
+                AtomicBool::new(true),
+            ));
+            app.lock_cooperatively()
+        } else {
+            app.lock_cooperatively()
+        };
+        #[cfg(test)]
+        test_fault::ack_checkpoint(0);
         let ack = Ack {
             nonce: value,
             locked: app.screen == Screen::Login,
             draft_persisted: durable,
         };
         let bytes = serde_json::to_vec(&ack).map_err(io::Error::other)?;
+        #[cfg(test)]
+        let verifications = std::cell::Cell::new(0);
         self.dir
-            .atomic(
+            .atomic_key_free(
                 &self.ack,
                 |file| Ok(file.write_all(&bytes)?),
                 |file| {
                     let mut read = Vec::new();
                     file.take(MAX_FILE + 1).read_to_end(&mut read)?;
                     anyhow::ensure!(read == bytes, "lock acknowledgement verification failed");
+                    #[cfg(test)]
+                    {
+                        verifications.set(verifications.get() + 1);
+                        test_fault::ack_checkpoint(verifications.get());
+                    }
                     Ok(())
                 },
                 &mut self.ack_file,
@@ -225,6 +249,25 @@ impl Drop for Registration {
             }
         }
         signal_hook::low_level::unregister(self.signal);
+    }
+}
+
+#[cfg(test)]
+mod test_fault {
+    use super::*;
+    thread_local! {
+        pub static DUPLICATE: std::cell::RefCell<Option<(usize, Arc<AtomicBool>)>> = const { std::cell::RefCell::new(None) };
+    }
+    pub fn ack_checkpoint(phase: usize) {
+        DUPLICATE.with(|hook| {
+            let mut hook = hook.borrow_mut();
+            if hook.as_ref().is_some_and(|(at, _)| *at == phase) {
+                let (_, flag) = hook.take().unwrap();
+                // Exactly the signal handler's action, without signalling unrelated
+                // registrations concurrently alive in other unit-test threads.
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
     }
 }
 
@@ -436,6 +479,51 @@ mod tests {
         assert_eq!(app.screen, Screen::Index);
     }
 
+    fn duplicate_during_ack(phase: usize) {
+        let root = TestRoot::new();
+        let mut reg = Registration::for_test(&root.0).unwrap();
+        let mut app = App::for_test(None);
+        let value = b"dddddddddddddddddddddddddddddddd";
+        root.private_write("request", value);
+        reg.flag.store(true, Ordering::SeqCst);
+        test_fault::DUPLICATE.with(|hook| {
+            *hook.borrow_mut() = Some((phase, Arc::clone(&reg.flag)));
+        });
+        let result = reg.process(&mut app);
+        assert_eq!(app.screen, Screen::Login);
+        assert!(app.db_key.is_none() && app.kdbx.is_none());
+        assert!(reg.pending(), "duplicate signal must remain pending");
+        assert!(
+            result.is_ok(),
+            "key-free ack must survive duplicate: {result:?}"
+        );
+        let bytes = fs::read(root.path("ack")).expect("current acknowledgment published");
+        let ack: Ack = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack.nonce.as_bytes(), value);
+        assert!(ack.locked && ack.draft_persisted);
+        // Consume the duplicate without granting the nonce permission to lock again.
+        app.screen = Screen::Index;
+        reg.process(&mut app).unwrap();
+        assert_eq!(app.screen, Screen::Index);
+        assert!(!reg.pending());
+        assert_eq!(fs::read(root.path("ack")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn duplicate_after_lock_cannot_suppress_acknowledgment() {
+        duplicate_during_ack(0);
+    }
+
+    #[test]
+    fn duplicate_before_ack_rename_cannot_suppress_acknowledgment() {
+        duplicate_during_ack(1);
+    }
+
+    #[test]
+    fn duplicate_after_ack_rename_cannot_suppress_acknowledgment() {
+        duplicate_during_ack(2);
+    }
+
     #[test]
     fn unsafe_ack_target_never_follows_or_overwrites_a_link() {
         let root = TestRoot::new();
@@ -501,9 +589,12 @@ mod tests {
         });
         app.screen = Screen::Login;
         if mode == "draft" || mode == "failed-draft" {
-            let (db, key, _) = crate::db::create_database(&path, "synthetic master", None).unwrap();
+            crate::db::create_database(&path, "synthetic master", None).unwrap();
+            let (db, key, _, revision) =
+                crate::db::unlock_database_snapshot(&path, "synthetic master", None).unwrap();
             app.kdbx = Some(db);
             app.db_key = Some(key);
+            app.primary_revision = Some(revision);
             app.screen = Screen::Edit;
             app.edit_entry = Some(crate::db::Entry {
                 password: "synthetic secret".into(),

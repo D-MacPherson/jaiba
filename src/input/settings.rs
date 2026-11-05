@@ -5,8 +5,11 @@ use crossterm::event::KeyCode;
 
 use crate::app::{App, ExportStep, ImportStep, PasswordChangeStep, Screen};
 use crate::config::save_config;
+#[cfg(test)]
+use crate::db::unlock_database;
 use crate::db::{
-    Entry, SaveError, build_database_key, calculate_warnings, save_database, unlock_database,
+    Entry, SaveError, build_database_key_with_yubikey, calculate_warnings, save_database,
+    unlock_database_snapshot_with_yubikey,
 };
 use crate::theme::load_theme;
 use crate::util::expand_tilde;
@@ -280,18 +283,19 @@ fn verify_current_password(app: &mut App) {
         return;
     };
 
-    match unlock_database(&path, &app.current_password_buffer, app.database_keyfile()) {
+    match unlock_database_snapshot_with_yubikey(
+        &path,
+        &app.current_password_buffer,
+        app.database_keyfile(),
+        app.database_yubikey(),
+    ) {
         Ok(_) => {
             app.current_password_buffer.clear();
             app.status = None;
             app.password_change_step = PasswordChangeStep::NewPassword;
         }
         Err(err) => {
-            app.status = Some(if app.config.keyfile.is_some() {
-                format!("couldn't verify current password and keyfile: {err}")
-            } else {
-                "that isn't the current master password".to_string()
-            });
+            app.status = Some(format!("couldn't verify current credentials: {err:#}"));
             app.current_password_buffer.clear();
         }
     }
@@ -330,7 +334,11 @@ fn commit_password_change(app: &mut App) {
 
     #[cfg(test)]
     crate::recovery::interleave::before_rekey();
-    let new_key = match build_database_key(&app.new_password_buffer, app.database_keyfile()) {
+    let new_key = match build_database_key_with_yubikey(
+        &app.new_password_buffer,
+        app.database_keyfile(),
+        app.database_yubikey(),
+    ) {
         Ok(key) => key,
         Err(err) => {
             app.status = Some(format!("couldn't change password: {err:#}"));
@@ -674,8 +682,7 @@ fn do_export(app: &mut App) {
             };
 
             let mut entries = app.entries.clone();
-            save_database(&path, &key, &mut db, &mut entries)
-                .map_err(|err| anyhow::anyhow!("{err}"))
+            save_database(&path, &key, &mut db, &mut entries).map_err(anyhow::Error::new)
         }
         crate::export::ExportFormat::Csv => crate::export::export_csv(&path, &app.entries),
         crate::export::ExportFormat::Json => crate::export::export_json(&path, &app.entries),
@@ -683,6 +690,17 @@ fn do_export(app: &mut App) {
 
     app.status = Some(match result {
         Ok(()) => format!("exported {count} entries to {}", path.display()),
+        Err(err)
+            if matches!(
+                err.downcast_ref::<SaveError>(),
+                Some(SaveError::Verification(_))
+            ) =>
+        {
+            format!(
+                "Export target {} replaced, but not verified. Keep it and independently authenticate with all factors before relying on it: {err:#}",
+                path.display()
+            )
+        }
         Err(err) => format!("couldn't export: {err:#}"),
     });
 

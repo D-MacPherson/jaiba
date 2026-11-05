@@ -1,0 +1,241 @@
+#![doc = include_str!("../README.md")]
+
+#[cfg(not(any(feature = "rusb", feature = "nusb")))]
+compile_error!("Either the rusb or nusb feature must be enabled for this crate");
+
+#[cfg(all(feature = "nusb", not(feature = "rusb"), not(target_os = "windows")))]
+extern crate nusb;
+#[cfg(any(feature = "rusb", target_os = "windows"))]
+extern crate rusb;
+
+#[macro_use]
+extern crate structure;
+
+extern crate aes;
+extern crate hmac;
+extern crate rand;
+extern crate sha1;
+#[macro_use]
+extern crate bitflags;
+
+pub mod config;
+pub mod configure;
+pub mod error;
+pub mod hmacmode;
+pub mod operation;
+pub mod otpmode;
+mod sec;
+#[cfg(feature = "test-support")]
+pub mod test_support;
+mod usb;
+
+use aes::cipher::Block;
+use aes::Aes128;
+
+use config::Command;
+use config::{Config, Slot};
+use configure::DeviceModeConfig;
+use error::ChallengeResponseError;
+use hmacmode::Hmac;
+use otpmode::Aes128Block;
+use sec::{crc16, CRC_RESIDUAL_OK};
+use usb::{Backend, BackendType, Flags, Frame, CHALLENGE_SIZE};
+
+pub use usb::Device;
+
+/// The `Result` type used in this crate.
+type Result<T> = ::std::result::Result<T, ChallengeResponseError>;
+
+pub struct ChallengeResponse {
+    backend: BackendType,
+}
+
+impl ChallengeResponse {
+    /// Creates a new ChallengeResponse instance.
+    pub fn new() -> Result<Self> {
+        let backend = BackendType::new()?;
+        Ok(ChallengeResponse { backend })
+    }
+
+    pub fn find_device(&mut self) -> Result<Device> {
+        let _operation = operation::Operation::standard();
+        operation::native()?;
+        let result = self.backend.find_device();
+        operation::native()?;
+        result
+    }
+
+    pub fn find_device_from_serial(&mut self, serial: u32) -> Result<Device> {
+        let _operation = operation::Operation::standard();
+        operation::native()?;
+        let result = self.backend.find_device_from_serial(serial);
+        operation::native()?;
+        result
+    }
+
+    pub fn find_all_devices(&mut self) -> Result<Vec<Device>> {
+        let _operation = operation::Operation::standard();
+        operation::native()?;
+        let result = self.backend.find_all_devices();
+        operation::native()?;
+        result
+    }
+
+    pub fn read_serial_number(&mut self, conf: Config) -> Result<u32> {
+        self.backend
+            .read_serial_from_device(conf.device.bus_id, conf.device.address_id)
+    }
+
+    pub fn write_config(
+        &mut self,
+        conf: Config,
+        device_config: &mut DeviceModeConfig,
+    ) -> Result<()> {
+        let d = device_config.to_frame(conf.command);
+        let mut buf = [0; usb::STATUS_UPDATE_PAYLOAD_SIZE];
+
+        self.backend.with_device(
+            conf.device.bus_id,
+            conf.device.address_id,
+            |backend, handle| {
+                backend.wait(handle, |f| !f.contains(Flags::SLOT_WRITE_FLAG), &mut buf)?;
+
+                // TODO: Should check version number.
+
+                backend.write_frame(handle, &d)?;
+                backend.wait(handle, |f| !f.contains(Flags::SLOT_WRITE_FLAG), &mut buf)?;
+
+                Ok(())
+            },
+        )
+    }
+
+    pub fn challenge_response_hmac(&mut self, chall: &[u8], conf: Config) -> Result<Hmac> {
+        if chall.is_empty() || chall.len() > CHALLENGE_SIZE {
+            return Err(ChallengeResponseError::InvalidChallenge);
+        }
+        let mut hmac = Hmac([0; 20]);
+
+        self.backend.with_device(
+            conf.device.bus_id,
+            conf.device.address_id,
+            |backend, handle| {
+                let mut challenge = [0; CHALLENGE_SIZE];
+
+                if conf.variable && chall.last() == Some(&0) {
+                    challenge = [0xff; CHALLENGE_SIZE];
+                }
+
+                let mut command = Command::ChallengeHmac1;
+                if let Slot::Slot2 = conf.slot {
+                    command = Command::ChallengeHmac2;
+                }
+
+                (&mut challenge[..chall.len()]).copy_from_slice(chall);
+                let d = Frame::new(challenge, command);
+                let mut buf = [0; usb::STATUS_UPDATE_PAYLOAD_SIZE];
+                backend.wait(
+                    handle,
+                    |f| !f.contains(usb::Flags::SLOT_WRITE_FLAG),
+                    &mut buf,
+                )?;
+
+                backend.write_frame(handle, &d)?;
+
+                // Read the response.
+                let mut response = [0; usb::RESPONSE_SIZE];
+                backend.read_response(handle, &mut response)?;
+
+                // Check response.
+                if crc16(&response[..22]) != CRC_RESIDUAL_OK {
+                    return Err(ChallengeResponseError::WrongCRC);
+                }
+
+                hmac.0.clone_from_slice(&response[..20]);
+
+                Ok(hmac)
+            },
+        )
+    }
+
+    pub fn challenge_response_otp(&mut self, chall: &[u8], conf: Config) -> Result<Aes128Block> {
+        if chall.is_empty() || chall.len() > CHALLENGE_SIZE {
+            return Err(ChallengeResponseError::InvalidChallenge);
+        }
+        let mut block = Aes128Block {
+            block: Block::<Aes128>::from([0; 16]),
+        };
+
+        self.backend.with_device(
+            conf.device.bus_id,
+            conf.device.address_id,
+            |backend, handle| {
+                let mut challenge = [0; CHALLENGE_SIZE];
+
+                let mut command = Command::ChallengeOtp1;
+                if let Slot::Slot2 = conf.slot {
+                    command = Command::ChallengeOtp2;
+                }
+
+                (&mut challenge[..chall.len()]).copy_from_slice(chall);
+                let d = Frame::new(challenge, command);
+                let mut buf = [0; usb::STATUS_UPDATE_PAYLOAD_SIZE];
+
+                backend.wait(
+                    handle,
+                    |f| !f.contains(usb::Flags::SLOT_WRITE_FLAG),
+                    &mut buf,
+                )?;
+
+                backend.write_frame(handle, &d)?;
+
+                let mut response = [0; usb::RESPONSE_SIZE];
+                backend.read_response(handle, &mut response)?;
+
+                // Check response.
+                if crc16(&response[..18]) != CRC_RESIDUAL_OK {
+                    return Err(ChallengeResponseError::WrongCRC);
+                }
+
+                block.block.copy_from_slice(&response[..16]);
+
+                Ok(block)
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_device() {
+        let mut cr_client = match ChallengeResponse::new() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{:?}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = cr_client.find_device() {
+            assert!(matches!(e, ChallengeResponseError::DeviceNotFound));
+        };
+    }
+
+    #[test]
+    fn test_find_all_devices() {
+        let mut cr_client = match ChallengeResponse::new() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{:?}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = cr_client.find_all_devices() {
+            assert!(matches!(e, ChallengeResponseError::DeviceNotFound));
+        };
+    }
+}

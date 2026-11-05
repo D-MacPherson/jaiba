@@ -74,9 +74,19 @@ impl Drop for Snapshot {
     }
 }
 
+/// In-memory drafts need the same vault binding as the encrypted envelope.
+/// Never infer or replace this identity from a later authentication.
+#[derive(Clone)]
+struct Origin {
+    database: PathBuf,
+    root: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Draft {
+    #[serde(skip)]
+    origin: Option<Origin>,
     entry: Snapshot,
     original: Snapshot,
     selected: Option<usize>,
@@ -102,6 +112,19 @@ impl Draft {
             return None;
         }
         Some(Self {
+            // Use the path authenticated at unlock, even if its pathname is
+            // now missing or a configured symlink has been retargeted. A fresh
+            // canonicalize here could silently bind this draft to another vault.
+            // Missing provenance still captures the secrets, but never licenses
+            // restoration/publication under an identity invented on later login.
+            origin: app
+                .primary_revision
+                .as_ref()
+                .zip(app.kdbx.as_ref())
+                .map(|(revision, db)| Origin {
+                    database: revision.database_path().to_owned(),
+                    root: db.root().id().to_string(),
+                }),
             entry: Snapshot::from_entry(app.edit_entry.as_ref()?),
             original: Snapshot::from_entry(app.edit_original.as_ref().unwrap_or(&Entry::default())),
             selected: app.edit_state.selected(),
@@ -114,7 +137,34 @@ impl Draft {
                 .flatten(),
         })
     }
+    fn validate_origin(&self, app: &App) -> anyhow::Result<&Origin> {
+        let origin = self.origin.as_ref().context(
+            "Draft origin unavailable; keep this window open and the memory draft hidden; do not attach it to another vault",
+        )?;
+        let path = app
+            .database_path()
+            .context("No authenticated draft database")?;
+        let db = app
+            .kdbx
+            .as_ref()
+            .context("No authenticated draft database")?;
+        let revision = app
+            .primary_revision
+            .as_ref()
+            .context("No authenticated draft revision")?;
+        anyhow::ensure!(app.db_key.is_some(), "No authenticated draft key");
+        anyhow::ensure!(
+            revision.database_path() == origin.database
+                && fs::canonicalize(path)? == origin.database
+                && db.root().id().to_string() == origin.root,
+            "Draft belongs to a different database. Restore the original vault at {} and its configured path, then authenticate again. KEEP THIS WINDOW OPEN; the draft remains only in memory",
+            origin.database.display()
+        );
+        Ok(origin)
+    }
+
     pub fn restore(mut self, app: &mut App) -> anyhow::Result<()> {
+        self.validate_origin(app)?;
         anyhow::ensure!(
             self.selected.is_none_or(|index| index <= 6),
             "Invalid draft field"
@@ -258,7 +308,7 @@ impl Slot {
             );
         }
         self.data_file = Some(file.try_clone()?);
-        let db = Database::open(&mut file, key.clone())?;
+        let db = crate::db::open_with_key(&mut file, key)?;
         self.ciphertext = Some(self.fingerprint()?);
         let entries: Vec<_> = db.iter_all_entries().collect();
         anyhow::ensure!(entries.len() == 1, "Invalid draft container");
@@ -296,9 +346,9 @@ impl Slot {
         self.ciphertext = None;
         self.dir.atomic(
             &self.name,
-            |file| db.save(file, key.clone()).map_err(anyhow::Error::from),
+            |file| crate::db::save_with_key(&db, file, key),
             |file| {
-                let reopened = Database::open(file, key.clone())?;
+                let reopened = crate::db::open_with_key(file, key)?;
                 let entries: Vec<_> = reopened.iter_all_entries().collect();
                 anyhow::ensure!(
                     entries.len() == 1 && entries[0].get(PAYLOAD) == Some(value),
@@ -385,23 +435,29 @@ impl Slot {
 }
 
 pub fn persist(app: &mut App, draft: &Draft) -> anyhow::Result<()> {
+    // Cancellation must revoke before starting filesystem transactions or KDFs.
+    challenge_response::operation::check()?;
+    let origin = draft.validate_origin(app)?;
     anyhow::ensure!(
         !draft.deletion_committed,
         "Committed deletion awaits recovery cleanup"
     );
     let key = app.db_key.as_ref().context("No database key for draft")?;
-    let db = app.kdbx.as_ref().context("No open database for draft")?;
     let transaction =
         Transaction::begin(app.database_path().context("No open database for draft")?)?;
     let path = transaction.path.clone();
-    let root = db.root().id().to_string();
-    let (policy, primary_file, primary_ciphertext) = verify_primary(&path, key, &root, draft)?;
+    anyhow::ensure!(
+        path == origin.database,
+        "Draft database path changed before publication; keep the memory draft"
+    );
+    let (policy, primary_file, primary_ciphertext) =
+        verify_primary(&path, key, &origin.root, draft)?;
     #[cfg(test)]
     interleave::before_publication();
     let envelope = Envelope {
         version: 1,
-        database: fs::canonicalize(&path)?,
-        root: db.root().id().to_string(),
+        database: origin.database.clone(),
+        root: origin.root.clone(),
         draft: draft.clone(),
     };
     let value = Zeroizing::new(serde_json::to_string(&envelope)?);
@@ -439,7 +495,7 @@ fn verify_primary(
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     let ciphertext = Sha256::digest(&bytes).into();
-    let current = Database::open(&mut io::Cursor::new(&bytes), key.clone())
+    let current = crate::db::open_with_key(&mut io::Cursor::new(&bytes), key)
         .context("Original database credentials changed; draft must remain in memory")?;
     anyhow::ensure!(
         current.root().id().to_string() == root,
@@ -541,7 +597,14 @@ pub fn recover(app: &mut App) -> anyhow::Result<()> {
             && envelope.root == app.kdbx.as_ref().unwrap().root().id().to_string(),
         "Draft belongs to a different database"
     );
-    envelope.draft.restore(app)
+    let mut draft = envelope.draft;
+    // The authenticated envelope is authoritative for disk recovery. This
+    // field is intentionally not serialized a second time inside its payload.
+    draft.origin = Some(Origin {
+        database: envelope.database,
+        root: envelope.root,
+    });
+    draft.restore(app)
 }
 
 /// Refuse to forget the editor if retirement of an old recovery record fails.

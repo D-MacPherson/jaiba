@@ -69,6 +69,21 @@ fn copy_and_report(app: &mut App, label: &str, text: &str) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static EXPIRY_READ: std::cell::RefCell<Option<Result<String, arboard::Error>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn read_native(clipboard: Option<&mut Clipboard>) -> Result<String, arboard::Error> {
+    #[cfg(test)]
+    if let Some(result) = EXPIRY_READ.with(|hook| hook.borrow_mut().take()) {
+        return result;
+    }
+    clipboard
+        .ok_or(arboard::Error::ClipboardNotSupported)?
+        .get_text()
+}
+
 pub fn maybe_clear_clipboard(app: &mut App) {
     let Some(timer) = app.clipboard_timer.as_ref() else {
         return;
@@ -81,25 +96,41 @@ pub fn maybe_clear_clipboard(app: &mut App) {
     let mut timer = app.clipboard_timer.take().unwrap();
     timer.forget_plaintext();
 
-    if let Some(clipboard) = app.clipboard.as_mut() {
-        let holds_ours = match clipboard.get_text() {
-            Ok(mut current) => {
-                let matches = timer.matches_text(&current);
-                current.zeroize();
-                matches
-            }
-            Err(_) => false,
-        };
+    let holds_ours = match read_native(app.clipboard.as_mut()) {
+        Ok(mut current) => {
+            let matches = timer.matches_text(&current);
+            current.zeroize();
+            matches
+        }
+        Err(err) => {
+            app.status = Some(format!(
+                "Clipboard clearing not verified; will retry: {err}"
+            ));
+            app.clipboard_timer = Some(timer);
+            return;
+        }
+    };
 
-        if holds_ours {
-            if let Err(err) = clipboard.clear() {
-                app.status = Some(format!("Couldn't clear clipboard: {err}"));
-                return;
-            }
+    if holds_ours {
+        let result = app
+            .clipboard
+            .as_mut()
+            .ok_or(arboard::Error::ClipboardNotSupported)
+            .and_then(Clipboard::clear);
+        if let Err(err) = result {
+            app.status = Some(format!(
+                "Clipboard clearing not verified; will retry: {err}"
+            ));
+            app.clipboard_timer = Some(timer);
+            return;
         }
     }
 
-    app.status = Some("Clipboard cleared".to_string());
+    app.status = Some(if holds_ours {
+        "Clipboard cleared".to_string()
+    } else {
+        "Clipboard changed; left untouched".to_string()
+    });
 }
 
 pub fn cp_user(app: &mut App) {
@@ -134,5 +165,53 @@ pub fn cp_url(app: &mut App) {
     if let Some(entry) = app.selected_entry() {
         let url = entry.url.clone();
         copy_and_report(app, "URL", &url);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expired() -> App {
+        let mut app = App::for_test(None);
+        app.clipboard_timer = Some(ClipboardTimer {
+            label: "synthetic password".into(),
+            expected: "synthetic clipboard secret".into(),
+            fingerprint: None,
+            clear_at: Instant::now(),
+        });
+        app
+    }
+
+    #[test]
+    fn native_read_failure_retains_zeroized_expiry_for_retry() {
+        let mut app = expired();
+        let deadline = app.clipboard_timer.as_ref().unwrap().clear_at;
+        EXPIRY_READ
+            .with(|hook| *hook.borrow_mut() = Some(Err(arboard::Error::ClipboardNotSupported)));
+        maybe_clear_clipboard(&mut app);
+        let timer = app
+            .clipboard_timer
+            .as_ref()
+            .expect("unverified clearing must remain pending");
+        assert!(timer.expected.is_empty());
+        assert!(timer.matches_text("synthetic clipboard secret"));
+        assert_eq!(timer.clear_at, deadline);
+        assert!(app.status.as_deref().unwrap().contains("not verified"));
+        assert!(app.clipboard.is_none(), "no live clipboard acquired");
+        // A subsequent successful read of different text resolves the timer but
+        // must never erase the replacement value or claim it was cleared.
+        EXPIRY_READ.with(|hook| *hook.borrow_mut() = Some(Ok("synthetic replacement".into())));
+        maybe_clear_clipboard(&mut app);
+        assert!(app.clipboard_timer.is_none());
+        assert!(app.status.as_deref().unwrap().contains("changed"));
+    }
+
+    #[test]
+    fn missing_native_handle_never_reports_successful_clearing() {
+        let mut app = expired();
+        maybe_clear_clipboard(&mut app);
+        assert!(app.clipboard_timer.is_some());
+        assert!(app.status.as_deref().unwrap().contains("not verified"));
     }
 }

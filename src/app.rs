@@ -76,6 +76,7 @@ pub struct App {
     pub primary_revision: Option<crate::db::Revision>,
     pub open_database: Option<PathBuf>,
     pub open_keyfile: Option<PathBuf>,
+    pub open_yubikey: Option<crate::config::YubikeyConfig>,
     pub pending_draft: Option<crate::recovery::Draft>,
     pub draft_slot: Option<crate::recovery::Slot>,
     pub draft_durable: bool,
@@ -150,6 +151,7 @@ impl App {
             primary_revision: None,
             open_database: None,
             open_keyfile: None,
+            open_yubikey: None,
             pending_draft: None,
             draft_slot: None,
             draft_durable: true,
@@ -279,6 +281,29 @@ impl App {
         }
     }
 
+    pub fn database_yubikey(&self) -> Option<crate::config::YubikeyConfig> {
+        if self.open_database.is_some() {
+            self.open_yubikey
+        } else {
+            self.config.yubikey
+        }
+    }
+
+    /// Reject ordinary actions that could bypass unresolved memory recovery.
+    /// This performs no persistence or authentication and never consumes the draft.
+    pub fn protect_memory_draft(&mut self) -> bool {
+        if self.pending_draft.is_none() {
+            return false;
+        }
+        self.hide_failed_recovery();
+        self.should_quit = false;
+        self.login_error = Some(
+            "Draft only in memory. KEEP THIS WINDOW OPEN. Restore the original vault and its configured path, then authenticate to recover before creating another vault or exiting."
+                .into(),
+        );
+        true
+    }
+
     /// Called only by the normal application loop, never a signal handler.
     pub fn hide_failed_recovery(&mut self) {
         // Authentication succeeded but the snapshot is not usable. Do not turn
@@ -289,6 +314,7 @@ impl App {
 
     /// Called only by the normal application loop, never a signal handler.
     pub fn lock_cooperatively(&mut self) -> bool {
+        let _operation = challenge_response::operation::Operation::standard();
         if let Some(draft) = crate::recovery::Draft::capture(self) {
             self.pending_draft = Some(draft);
             self.draft_durable = false;
@@ -296,6 +322,7 @@ impl App {
         if self.open_database.is_none() {
             self.open_database = self.config.default_database.clone();
             self.open_keyfile = self.config.keyfile.clone();
+            self.open_yubikey = self.config.yubikey;
         }
         if let Some(draft) = self.pending_draft.clone() {
             if crate::recovery::persist(self, &draft).is_ok() {
@@ -303,12 +330,14 @@ impl App {
                 self.draft_durable = true;
             }
         }
+        // No credential-bearing work remains. Revoke before any key-free
+        // durability revalidation, which may itself encounter slow storage.
+        clear_unlocked_state(self);
         if self.draft_durable {
             if let Some(slot) = &self.draft_slot {
                 self.draft_durable = slot.revalidate().is_ok();
             }
         }
-        clear_unlocked_state(self);
         self.login_error = Some(if self.pending_draft.is_some() {
             "Locked; draft only in memory. KEEP THIS WINDOW OPEN and authenticate to recover."
                 .into()
@@ -381,13 +410,18 @@ pub fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     slim_mode: bool,
 ) -> io::Result<()> {
+    // Authentication factors must never disappear behind default configuration.
+    let mut config = load_config().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Invalid config: {err:#}"),
+        )
+    })?;
     // Refuse unsafe vault registration before reading credentials or opening a clipboard.
     let mut registration = crate::locking::Registration::start()?;
     let terminal_clipboard =
         crate::terminal_clipboard::enabled(std::env::var_os("JAIBA_CLIPBOARD_BACKEND").as_deref())?;
     let _ = crate::theme::ensure_default_themes();
-
-    let mut config = load_config().unwrap_or_default();
 
     if config.default_database.is_none() {
         let default_path = crate::util::default_new_database_path();
@@ -444,6 +478,7 @@ pub fn run(
         primary_revision: None,
         open_database: None,
         open_keyfile: None,
+        open_yubikey: None,
         pending_draft: None,
         draft_slot: None,
         draft_durable: true,
@@ -495,9 +530,16 @@ pub fn run(
         })?;
 
         if event::poll(TICK_RATE)? {
+            if registration.as_ref().is_some_and(|r| r.pending()) {
+                continue;
+            }
             if let Event::Key(key) = event::read()? {
+                if registration.as_ref().is_some_and(|r| r.pending()) {
+                    continue;
+                }
                 app.last_activity = Instant::now();
 
+                let _operation = challenge_response::operation::Operation::standard();
                 match app.screen {
                     Screen::Login => handle_login_input(&mut app, key.code),
                     Screen::Index => handle_index_input(&mut app, key),
@@ -507,10 +549,18 @@ pub fn run(
             }
         }
 
+        // A cancelled synchronous handler must not do clipboard I/O or accept
+        // another key before the pending coordinator request is processed.
+        if registration.as_ref().is_some_and(|r| r.pending()) {
+            continue;
+        }
         maybe_clear_clipboard(&mut app);
         maybe_auto_lock(&mut app);
 
         if app.should_quit {
+            if app.protect_memory_draft() {
+                continue;
+            }
             break;
         }
     }
@@ -725,12 +775,11 @@ mod lock_tests {
         let path = fixture.0.join("composite.kdbx");
         let keyfile = fixture.0.join("synthetic.key");
         fs::write(&keyfile, [42u8; 32]).unwrap();
-        let (db, key, _) =
-            crate::db::create_database(&path, "synthetic master", Some(&keyfile)).unwrap();
+        crate::db::create_database(&path, "synthetic master", Some(&keyfile)).unwrap();
         let mut app = App::for_test(Some(path.clone()));
         app.config.keyfile = Some(keyfile.clone());
-        app.kdbx = Some(db);
-        app.db_key = Some(key.clone());
+        authenticate(&mut app, "synthetic master");
+        let key = app.db_key.as_ref().unwrap().clone();
         draft(&mut app);
         assert!(app.lock_cooperatively());
         let dir = crate::recovery::directory(&path);

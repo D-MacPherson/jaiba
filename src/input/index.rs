@@ -4,6 +4,9 @@ use crate::app::App;
 use crate::input::command::{handle_shortcut, preview_entry};
 
 pub fn handle_index_input(app: &mut App, key: KeyEvent) {
+    if app.protect_memory_draft() {
+        return;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         if let KeyCode::Char(c) = key.code {
             app.status = None;

@@ -26,13 +26,20 @@ serde_json = "1"
 csv = "1"
 anyhow = "1.0.104"
 toml = "1.1.4"
-keepass = { version = "0.13.20", features = ["save_kdbx4", "totp"] }
+keepass = { version = "=0.13.20", features = ["save_kdbx4", "totp", "challenge_response"] }
 chrono = "0.4.45"
 unicode-width = "0.2.2"
 libc = "0.2"
 signal-hook = "0.3"
 zeroize = "1.8.2"
 sha2 = "0.10.9"
+challenge_response = { version = "=0.5.46", default-features = false, features = ["nusb"] }
+
+[patch.crates-io]
+challenge_response = { path = "vendor/challenge_response" }
+
+[dev-dependencies]
+challenge_response = { version = "=0.5.46", default-features = false, features = ["nusb", "test-support"] }
 
 [profile.release]
 strip = true

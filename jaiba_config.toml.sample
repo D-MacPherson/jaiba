@@ -13,3 +13,12 @@ clipboard_timeout = 15
 
 # Name of a theme installed in ~/.config/rama/themes/.
 theme = "catppuccin-mocha"
+
+# Optional native YubiKey HMAC-SHA1 factor, IN ADDITION to the password and
+# optional keyfile. Both serial (nonzero u32) and slot (1 or 2) are mandatory.
+# Omit the entire table for existing password/password+keyfile vaults.
+# This selects an already configured key; Jaiba never programs it.
+# Read YUBIKEY.md: touch-enabled keys may block, including cooperative locking.
+# [yubikey]
+# slot = 2
+# serial = 39269826

@@ -768,7 +768,8 @@ fn review_logic4_draft_wins_denies_rekey_before_publication_including_aliases() 
         rekey(&mut changing);
         assert!(
             changing.status.as_ref().unwrap().contains("draft"),
-            "published draft also blocks rekey"
+            "published draft also blocks rekey: {:?}",
+            changing.status
         );
         let mut recovering = App::for_test(Some(path));
         auth(&mut recovering);
@@ -1008,6 +1009,433 @@ fn review_logic2_failed_restore_keeps_memory_and_false_durability_until_target_f
     );
     assert!(app.lock_cooperatively());
 }
+fn save_recovered_origin(app: &mut App, notes: &str, expected_id: Option<keepass::db::EntryId>) {
+    let path = app.database_path().unwrap().to_owned();
+    input::edit::handle_edit_input(app, KeyCode::Enter);
+    input::edit::handle_edit_input(app, KeyCode::Esc);
+    input::edit::handle_edit_input(app, KeyCode::Char('y'));
+    assert_eq!(app.screen, Screen::Index, "{:?}", app.status);
+    let saved = db::unlock_database(&path, "synthetic master", None)
+        .unwrap()
+        .2;
+    assert_eq!(
+        saved.len(),
+        1,
+        "recovery must not duplicate or lose an entry"
+    );
+    assert_eq!(saved[0].notes, notes);
+    if let Some(id) = expected_id {
+        assert_eq!(saved[0].id, Some(id));
+    }
+    assert!(saved[0].id.is_some());
+    assert!(app.pending_draft.is_none() && app.draft_slot.is_none());
+}
+
+fn memory_origin_replacement_root(existing: bool) {
+    let f = Fixture::new();
+    let mut app = f.app();
+    let expected_id = if existing {
+        existing_draft(&mut app).id
+    } else {
+        draft(&mut app);
+        None
+    };
+    app.edit_state.select(Some(5));
+    app.editing_field = true;
+    app.field_buffer = "synthetic origin-bound partial notes λ\n  ".into();
+    let path = app.database_path().unwrap().to_owned();
+    let original = fs::read(&path).unwrap();
+    let original_root = app.kdbx.as_ref().unwrap().root().id();
+    let directory = recovery::directory(&path);
+    fs::write(&directory, b"synthetic persistence blocker").unwrap();
+    assert!(!app.lock_cooperatively());
+    assert!(app.pending_draft.is_some() && !app.draft_durable);
+    fs::remove_file(&directory).unwrap();
+
+    // Same password, same pathname and (for edits) same entry ID must not
+    // authorize disclosure into a different authenticated root database.
+    let mut replacement = Database::new();
+    replacement.config.kdf_config = KdfConfig::Aes { rounds: 128 };
+    assert_ne!(replacement.root().id(), original_root);
+    if let Some(id) = expected_id {
+        replacement
+            .root_mut()
+            .add_entry_with_id(id)
+            .unwrap()
+            .set_unprotected("Title", "synthetic colliding replacement entry");
+    }
+    let key = DatabaseKey::new().with_password("synthetic master");
+    db::save_database(&path, &key, &mut replacement, &mut []).unwrap();
+    let replacement_bytes = fs::read(&path).unwrap();
+    for _ in 0..3 {
+        auth(&mut app);
+        assert_eq!(
+            app.screen,
+            Screen::Login,
+            "a replacement root must not receive a hidden memory draft"
+        );
+        assert!(app.pending_draft.is_some() && !app.draft_durable);
+        assert!(app.edit_entry.is_none() && app.field_buffer.is_empty());
+        assert!(app.db_key.is_none() && app.kdbx.is_none());
+        let error = app.login_error.as_deref().unwrap();
+        assert!(error.contains("Restore the original vault"), "{error}");
+        assert!(!app.lock_cooperatively());
+        input::login::handle_login_input(&mut app, KeyCode::Esc);
+        assert!(!app.should_quit);
+        assert_eq!(fs::read(&path).unwrap(), replacement_bytes);
+        assert!(!directory.exists(), "never publish into a mismatched vault");
+    }
+    // Existing Login recovery route: restore the original file externally and
+    // authenticate again. Wrong credentials still cannot disclose the draft.
+    fs::write(&path, &original).unwrap();
+    app.password = "wrong synthetic master".into();
+    input::login::handle_login_input(&mut app, KeyCode::Enter);
+    assert_eq!(app.screen, Screen::Login);
+    assert!(app.pending_draft.is_some());
+    auth(&mut app);
+    assert_eq!(app.screen, Screen::Edit, "{:?}", app.login_error);
+    assert_eq!(app.edit_entry.as_ref().unwrap().id, expected_id);
+    assert_eq!(
+        app.edit_entry.as_ref().unwrap().password,
+        if existing {
+            "synthetic unsaved password"
+        } else {
+            "synthetic secret"
+        }
+    );
+    assert_eq!(
+        app.field_buffer,
+        "synthetic origin-bound partial notes λ\n  "
+    );
+    assert!(app.editing_field);
+    assert_eq!(app.edit_state.selected(), Some(5));
+    assert!(app.pending_draft.is_none());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(
+        app.lock_cooperatively(),
+        "original restored draft can become durable"
+    );
+    auth(&mut app);
+    assert_eq!(app.screen, Screen::Edit);
+    assert_eq!(
+        app.field_buffer,
+        "synthetic origin-bound partial notes λ\n  "
+    );
+    save_recovered_origin(
+        &mut app,
+        "synthetic origin-bound partial notes λ\n  ",
+        expected_id,
+    );
+}
+
+fn missing_primary_creation_preserves_origin(existing: bool) {
+    for alias in [false, true] {
+        let f = Fixture::new();
+        let mut app = f.app();
+        let expected_id = if existing {
+            existing_draft(&mut app).id
+        } else {
+            draft(&mut app);
+            None
+        };
+        app.edit_state.select(Some(5));
+        app.editing_field = true;
+        app.field_buffer = "synthetic creation-bypass draft".into();
+        let original_path = app.database_path().unwrap().to_owned();
+        let original_bytes = fs::read(&original_path).unwrap();
+        let configured = f.0.join("configured.kdbx");
+        let missing = f.0.join("missing-replacement.kdbx");
+        if alias {
+            std::os::unix::fs::symlink(&original_path, &configured).unwrap();
+            app.open_database = Some(configured.clone());
+            app.config.default_database = Some(configured.clone());
+            fs::remove_file(&configured).unwrap();
+            std::os::unix::fs::symlink(&missing, &configured).unwrap();
+        } else {
+            fs::remove_file(&original_path).unwrap();
+        }
+        assert!(!app.lock_cooperatively());
+        assert!(app.pending_draft.is_some());
+        input::login::handle_login_input(&mut app, KeyCode::Esc);
+        assert!(!app.should_quit);
+        input::login::handle_login_input(&mut app, KeyCode::Char('n'));
+        for c in "synthetic replacement master".chars() {
+            input::login::handle_login_input(&mut app, KeyCode::Char(c));
+        }
+        input::login::handle_login_input(&mut app, KeyCode::Enter);
+        for c in "synthetic replacement master".chars() {
+            input::login::handle_login_input(&mut app, KeyCode::Char(c));
+        }
+        input::login::handle_login_input(&mut app, KeyCode::Enter);
+        if app.screen == Screen::Index {
+            input::index::handle_index_input(
+                &mut app,
+                crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+            );
+        } else {
+            input::login::handle_login_input(&mut app, KeyCode::Esc);
+        }
+        assert!(
+            !app.should_quit,
+            "creation must not permit exit with an original hidden draft"
+        );
+        assert_eq!(app.screen, Screen::Login);
+        assert!(!app.creating_database && !app.confirming_new_db_password);
+        assert!(app.pending_draft.is_some() && !app.draft_durable);
+        assert!(app.kdbx.is_none() && app.db_key.is_none());
+        assert!(app.password.is_empty() && app.new_db_confirm.is_empty());
+        assert!(!missing.exists());
+        if alias {
+            assert_eq!(fs::read(&original_path).unwrap(), original_bytes);
+            assert!(fs::symlink_metadata(&configured).unwrap().is_symlink());
+            assert_eq!(fs::read_link(&configured).unwrap(), missing);
+        } else {
+            assert!(!original_path.exists(), "do not create a replacement vault");
+        }
+        for _ in 0..2 {
+            assert!(!app.lock_cooperatively());
+        }
+        if alias {
+            fs::remove_file(&configured).unwrap();
+            std::os::unix::fs::symlink(&original_path, &configured).unwrap();
+        } else {
+            fs::write(&original_path, &original_bytes).unwrap();
+        }
+        app.password = "wrong synthetic master".into();
+        input::login::handle_login_input(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Login);
+        assert!(app.pending_draft.is_some());
+        auth(&mut app);
+        assert_eq!(app.screen, Screen::Edit, "{:?}", app.login_error);
+        assert_eq!(app.field_buffer, "synthetic creation-bypass draft");
+        assert_eq!(app.edit_entry.as_ref().unwrap().id, expected_id);
+        save_recovered_origin(&mut app, "synthetic creation-bypass draft", expected_id);
+    }
+}
+
+#[test]
+fn acceptance_pending_new_draft_blocks_missing_primary_creation_and_exit() {
+    missing_primary_creation_preserves_origin(false);
+}
+
+#[test]
+fn acceptance_pending_existing_draft_blocks_missing_primary_creation_and_exit() {
+    missing_primary_creation_preserves_origin(true);
+}
+
+#[test]
+fn acceptance_pending_draft_blocks_already_started_creation() {
+    let f = Fixture::new();
+    let mut app = f.app();
+    draft(&mut app);
+    let path = app.database_path().unwrap().to_owned();
+    fs::remove_file(&path).unwrap();
+    assert!(!app.lock_cooperatively());
+    app.creating_database = true;
+    app.confirming_new_db_password = true;
+    app.password = "synthetic replacement master".into();
+    app.new_db_confirm = app.password.clone();
+    input::login::handle_login_input(&mut app, KeyCode::Enter);
+    assert_eq!(app.screen, Screen::Login);
+    assert!(!path.exists());
+    assert!(app.pending_draft.is_some());
+    assert!(!app.creating_database && !app.confirming_new_db_password);
+}
+
+#[test]
+fn acceptance_index_with_hidden_pending_draft_cannot_exit_or_open_another_editor() {
+    for key in [
+        crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+        crossterm::event::KeyEvent::new(
+            KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ),
+    ] {
+        let f = Fixture::new();
+        let mut app = f.app();
+        draft(&mut app);
+        app.pending_draft = recovery::Draft::capture(&app);
+        app.hide_failed_recovery();
+        app.screen = Screen::Index; // Defensive invariant: pending recovery must gate all Index actions.
+        input::index::handle_index_input(&mut app, key);
+        assert!(!app.should_quit);
+        assert_eq!(app.screen, Screen::Login);
+        assert!(app.pending_draft.is_some() && app.edit_entry.is_none());
+        auth(&mut app);
+        assert_eq!(app.screen, Screen::Edit);
+        assert_eq!(app.field_buffer, "synthetic partial notes");
+    }
+}
+
+#[test]
+fn acceptance_memory_new_draft_rejects_replacement_root_and_recovers_original() {
+    memory_origin_replacement_root(false);
+}
+
+#[test]
+fn acceptance_memory_existing_draft_rejects_replacement_root_and_recovers_original() {
+    memory_origin_replacement_root(true);
+}
+
+fn memory_origin_retargeted_path(existing: bool) {
+    let f = Fixture::new();
+    let mut seed = f.app();
+    if existing {
+        existing_draft(&mut seed);
+    }
+    let original_path = seed.database_path().unwrap().to_owned();
+    let original_bytes = fs::read(&original_path).unwrap();
+    let copied_path = f.0.join("same-root-copy.kdbx");
+    fs::write(&copied_path, &original_bytes).unwrap();
+    let alias = f.0.join("configured-alias.kdbx");
+    std::os::unix::fs::symlink(&original_path, &alias).unwrap();
+    let mut app = loaded(alias.clone());
+    if existing {
+        app.screen = Screen::Edit;
+        app.edit_entry = Some(app.entries[0].clone());
+        app.edit_original = app.edit_entry.clone();
+        app.edit_target = Some(0);
+        app.edit_entry.as_mut().unwrap().password = "synthetic unsaved password".into();
+    } else {
+        draft(&mut app);
+    }
+    let expected = app.edit_entry.as_ref().unwrap().clone();
+    app.edit_state.select(Some(5));
+    app.editing_field = true;
+    app.field_buffer = "synthetic alias partial notes".into();
+    // Retarget *before* capture. The authenticated canonical origin, not a
+    // fresh lookup of this symlink during lock, must define the binding.
+    fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&copied_path, &alias).unwrap();
+    let directory = recovery::directory(&copied_path);
+    assert!(!app.lock_cooperatively());
+    assert!(app.pending_draft.is_some() && !app.draft_durable);
+    assert!(
+        !directory.exists(),
+        "publication must reject the retargeted vault"
+    );
+    for _ in 0..3 {
+        auth(&mut app);
+        assert_eq!(
+            app.screen,
+            Screen::Login,
+            "even identical root and entry IDs cannot authorize another canonical path"
+        );
+        assert!(app.pending_draft.is_some() && !app.draft_durable);
+        assert!(app.edit_entry.is_none() && app.field_buffer.is_empty());
+        assert!(app.db_key.is_none() && app.kdbx.is_none());
+        let error = app.login_error.as_deref().unwrap();
+        assert!(error.contains("Restore the original vault"), "{error}");
+        assert!(error.contains(original_path.to_str().unwrap()), "{error}");
+        assert!(!app.lock_cooperatively());
+        assert!(
+            !directory.exists(),
+            "do not rebind persistence to a copied vault"
+        );
+        assert_eq!(fs::read(&copied_path).unwrap(), original_bytes);
+    }
+    // Restoring the configured alias to the original canonical vault is the
+    // existing user-reachable rescue route; no draft is migrated or discarded.
+    fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&original_path, &alias).unwrap();
+    auth(&mut app);
+    assert_eq!(app.screen, Screen::Edit, "{:?}", app.login_error);
+    assert_eq!(app.edit_entry.as_ref().unwrap().id, expected.id);
+    assert_eq!(app.edit_entry.as_ref().unwrap().password, expected.password);
+    assert_eq!(app.field_buffer, "synthetic alias partial notes");
+    assert!(app.editing_field);
+    assert_eq!(app.edit_state.selected(), Some(5));
+    assert!(app.pending_draft.is_none());
+    assert!(app.lock_cooperatively());
+    auth(&mut app);
+    assert_eq!(app.screen, Screen::Edit);
+    assert_eq!(app.field_buffer, "synthetic alias partial notes");
+    assert_eq!(fs::read(&original_path).unwrap(), original_bytes);
+    assert_eq!(fs::read(&copied_path).unwrap(), original_bytes);
+    save_recovered_origin(&mut app, "synthetic alias partial notes", expected.id);
+    assert_eq!(fs::read(&copied_path).unwrap(), original_bytes);
+}
+
+#[test]
+fn acceptance_memory_new_draft_rejects_retargeted_canonical_path_and_recovers_original() {
+    memory_origin_retargeted_path(false);
+}
+
+#[test]
+fn acceptance_memory_existing_draft_rejects_retargeted_canonical_path_and_recovers_original() {
+    memory_origin_retargeted_path(true);
+}
+
+#[test]
+fn acceptance_memory_draft_captured_while_primary_missing_recovers_restored_origin() {
+    let f = Fixture::new();
+    let mut app = f.app();
+    draft(&mut app);
+    let path = app.database_path().unwrap().to_owned();
+    let original = fs::read(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    assert!(!app.lock_cooperatively());
+    assert!(app.pending_draft.is_some());
+    assert!(!app.lock_cooperatively());
+    assert!(!app.draft_durable);
+    assert!(app.edit_entry.is_none() && app.db_key.is_none());
+    fs::write(&path, &original).unwrap();
+    auth(&mut app);
+    assert_eq!(
+        app.screen,
+        Screen::Edit,
+        "canonicalization failure at capture must not strand a known authenticated origin: {:?}",
+        app.login_error
+    );
+    assert_eq!(app.field_buffer, "synthetic partial notes");
+    assert_eq!(
+        app.edit_entry.as_ref().unwrap().password,
+        "synthetic secret"
+    );
+    assert!(app.pending_draft.is_none());
+}
+
+#[test]
+fn acceptance_memory_origin_uses_authenticated_path_not_post_unlock_symlink_target() {
+    for existing in [false, true] {
+        let f = Fixture::new();
+        let mut app = f.app();
+        if existing {
+            existing_draft(&mut app);
+        } else {
+            draft(&mut app);
+        }
+        let original = app.database_path().unwrap().to_owned();
+        let captured = recovery::Draft::capture(&app).unwrap();
+        let copy = f.0.join("same-root-copy.kdbx");
+        fs::copy(&original, &copy).unwrap();
+        let alias = f.0.join("configured-alias.kdbx");
+        std::os::unix::fs::symlink(&copy, &alias).unwrap();
+        let mut authenticated = loaded(alias.clone());
+        authenticated.pending_draft = Some(captured);
+        // Deterministic seam between successful unlock and recovery: path
+        // resolution changes, but the authenticated database/revision do not.
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        assert!(
+            recovery::recover(&mut authenticated).is_err(),
+            "a fresh pathname lookup cannot change the authenticated origin"
+        );
+        assert!(authenticated.pending_draft.is_some());
+        authenticated.hide_failed_recovery();
+        assert_eq!(authenticated.screen, Screen::Login);
+        assert!(authenticated.edit_entry.is_none() && authenticated.db_key.is_none());
+        auth(&mut authenticated);
+        assert_eq!(
+            authenticated.screen,
+            Screen::Edit,
+            "{:?}",
+            authenticated.login_error
+        );
+        assert!(authenticated.pending_draft.is_none());
+    }
+}
+
 #[test]
 fn review_logic1_repeated_lock_revalidates_exact_ciphertext_and_lock_identity() {
     for fault in [

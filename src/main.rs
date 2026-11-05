@@ -14,6 +14,10 @@ mod terminal_clipboard;
 mod theme;
 mod ui;
 mod util;
+#[cfg(test)]
+mod yubikey_test_backend;
+#[cfg(test)]
+mod yubikey_tests;
 
 use std::io;
 

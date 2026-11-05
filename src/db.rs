@@ -7,11 +7,145 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::config::YubikeyConfig;
 use anyhow::Context;
 use chrono::Utc;
 use keepass::db::{EntryId, EntryMut, EntryRef, Times, fields};
 use keepass::{Database, DatabaseKey};
 use sha2::{Digest, Sha256};
+
+/// Always pass an unperformed clone; keepass performs a fresh per-container challenge.
+pub(crate) fn open_with_key(source: &mut dyn Read, key: &DatabaseKey) -> anyhow::Result<Database> {
+    let _operation = challenge_response::operation::Operation::standard();
+    challenge_response::operation::check()?;
+    let mut bytes = Vec::new();
+    source.read_to_end(&mut bytes)?;
+    preflight_legacy_header(&bytes)?;
+    // DatabaseKey exposes no factor accessor in keepass 0.13.20. Keep general
+    // parsing independent of USB limits. Native challenge_response_hmac also
+    // rejects invalid lengths before its fixed-array copy, including this route.
+    preflight_kdbx4_header(&bytes, false)?;
+    #[cfg(test)]
+    crate::yubikey_test_backend::operation("decrypt")?;
+    let db = Database::open(&mut std::io::Cursor::new(&bytes), key.clone())?;
+    challenge_response::operation::check()?;
+    Ok(db)
+}
+
+/// keepass 0.13.20 reads these KDBX3 scalars with unchecked byteorder calls.
+/// Apply this to every decrypt route, not just the import UI. Authentication and
+/// all semantic/cryptographic validation remain the library's responsibility.
+fn preflight_legacy_header(bytes: &[u8]) -> anyhow::Result<()> {
+    if !matches!(
+        Database::get_version(&mut std::io::Cursor::new(bytes)),
+        Ok(keepass::config::DatabaseVersion::KDB3(_))
+    ) {
+        return Ok(());
+    }
+    let mut header = &bytes[12..];
+    loop {
+        anyhow::ensure!(header.len() >= 3, "Truncated KDBX3 outer header");
+        let id = header[0];
+        let len = u16::from_le_bytes([header[1], header[2]]) as usize;
+        header = &header[3..];
+        anyhow::ensure!(len <= header.len(), "Truncated KDBX3 outer header field");
+        header = &header[len..];
+        if id == 0 {
+            return Ok(());
+        }
+        let width = match id {
+            3 | 10 => Some(4), // compression and inner random stream IDs
+            6 => Some(8),      // AES transform rounds
+            _ => None,
+        };
+        if let Some(width) = width {
+            anyhow::ensure!(len == width, "Invalid KDBX3 scalar width for field {id}");
+        }
+    }
+}
+
+/// Bounds-only scan of untrusted KDBX4 outer-header KDF parameters. This is
+/// not authentication or a replacement for keepass parsing. Only native hardware
+/// needs a 1..=64-byte challenge; password-only Argon2 salts may be larger.
+fn preflight_kdbx4_header(bytes: &[u8], hardware: bool) -> anyhow::Result<()> {
+    if !matches!(
+        Database::get_version(&mut std::io::Cursor::new(bytes)),
+        Ok(keepass::config::DatabaseVersion::KDB4(_))
+    ) {
+        return Ok(()); // let keepass diagnose non-KDBX4/invalid formats
+    }
+    fn take<'a>(input: &mut &'a [u8], len: usize) -> anyhow::Result<&'a [u8]> {
+        anyhow::ensure!(len <= input.len(), "Truncated KDBX4 KDF/header data");
+        let (head, tail) = input.split_at(len);
+        *input = tail;
+        Ok(head)
+    }
+    fn length(input: &mut &[u8]) -> anyhow::Result<usize> {
+        Ok(u32::from_le_bytes(take(input, 4)?.try_into()?) as usize)
+    }
+    let mut header = &bytes[12..];
+    loop {
+        let id = take(&mut header, 1)?[0];
+        let len = length(&mut header)?;
+        let mut value = take(&mut header, len)?;
+        if id == 0 {
+            break;
+        }
+        if id == 3 {
+            anyhow::ensure!(len == 4, "Invalid KDBX4 compression scalar width");
+        }
+        // Public custom data uses the same potentially panicking scalar decoder.
+        if id != 11 && id != 12 {
+            continue;
+        }
+        anyhow::ensure!(
+            take(&mut value, 2)? == [0, 1],
+            "Unsupported KDBX4 KDF dictionary version"
+        );
+        loop {
+            let kind = take(&mut value, 1)?[0];
+            if kind == 0 {
+                break;
+            }
+            let len = length(&mut value)?;
+            let name = take(&mut value, len)?;
+            let len = length(&mut value)?;
+            let _data = take(&mut value, len)?;
+            // Also prevent upstream scalar decoders from panicking on short values.
+            anyhow::ensure!(
+                match kind {
+                    0x04 | 0x0c => len == 4,
+                    0x05 | 0x0d => len == 8,
+                    0x08 => len == 1,
+                    0x18 | 0x42 => true,
+                    _ => false,
+                },
+                "Invalid KDBX4 KDF dictionary value"
+            );
+            if hardware && id == 11 && name == b"S" {
+                anyhow::ensure!(
+                    kind == 0x42 && (1..=64).contains(&len),
+                    "Unsupported KDBX4 challenge seed length (must be 1..=64 bytes)"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn save_with_key(
+    db: &Database,
+    dest: &mut dyn std::io::Write,
+    key: &DatabaseKey,
+) -> anyhow::Result<()> {
+    let _operation = challenge_response::operation::Operation::standard();
+    challenge_response::operation::check()?;
+    #[cfg(test)]
+    crate::yubikey_test_backend::operation("encrypt")?;
+    db.save(dest, key.clone())?;
+    challenge_response::operation::check()?;
+    Ok(())
+}
 
 /// Exact authenticated ciphertext, not a normalized in-memory serialization.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,6 +155,11 @@ pub struct Revision {
 }
 
 impl Revision {
+    /// Canonical primary path pinned when these ciphertext bytes authenticated.
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn revalidate(&self, path: &Path) -> anyhow::Result<()> {
         anyhow::ensure!(
             path == self.path,
@@ -148,15 +287,42 @@ pub fn unlock_database_snapshot(
     password: &str,
     keyfile_path: Option<&Path>,
 ) -> anyhow::Result<(Database, DatabaseKey, Vec<Entry>, Revision)> {
+    unlock_database_snapshot_with_yubikey(path, password, keyfile_path, None)
+}
+
+pub fn unlock_database_snapshot_with_yubikey(
+    path: &Path,
+    password: &str,
+    keyfile_path: Option<&Path>,
+    yubikey: Option<YubikeyConfig>,
+) -> anyhow::Result<(Database, DatabaseKey, Vec<Entry>, Revision)> {
+    let _operation = challenge_response::operation::Operation::standard();
+    challenge_response::operation::check()?;
     let path = fs::canonicalize(path)?;
     let bytes = fs::read(&path).with_context(|| format!("couldn't open {}", path.display()))?;
 
-    let key = build_database_key(password, keyfile_path)?;
-    let db = Database::open(&mut std::io::Cursor::new(&bytes), key.clone()).map_err(|err| {
-        match keyfile_path {
-            Some(_) => anyhow::anyhow!("unlock failed with password + keyfile: {err}"),
-            None => anyhow::anyhow!("unlock failed with password: {err}"),
-        }
+    if yubikey.is_some() {
+        let version = Database::get_version(&mut std::io::Cursor::new(&bytes))
+            .context("couldn't inspect database format for YubiKey authentication")?;
+        // KDBX3 does not perform the library's challenge-response step. Never
+        // accept it with silently weakened authentication or convert it here.
+        anyhow::ensure!(
+            matches!(version, keepass::config::DatabaseVersion::KDB4(_)),
+            "YubiKey challenge-response requires KDBX4; convert a disposable copy in KeePassXC first"
+        );
+        preflight_kdbx4_header(&bytes, true)?;
+    }
+    let key = build_database_key_with_yubikey(password, keyfile_path, yubikey)?;
+    let db = open_with_key(&mut std::io::Cursor::new(&bytes), &key).map_err(|err| {
+        anyhow::anyhow!(
+            "unlock failed with password{}{}: {err}",
+            if keyfile_path.is_some() {
+                " + keyfile"
+            } else {
+                ""
+            },
+            if yubikey.is_some() { " + YubiKey" } else { "" }
+        )
     })?;
 
     let entries = db
@@ -189,14 +355,27 @@ pub fn unlock_database_snapshot(
         path,
         ciphertext: Sha256::digest(&bytes).into(),
     };
+    challenge_response::operation::check()?;
     Ok((db, key, entries, revision))
 }
 
+#[cfg(test)]
 pub fn create_database(
     path: &Path,
     password: &str,
     keyfile_path: Option<&Path>,
 ) -> anyhow::Result<(Database, DatabaseKey, Vec<Entry>)> {
+    create_database_with_yubikey(path, password, keyfile_path, None)
+}
+
+pub fn create_database_with_yubikey(
+    path: &Path,
+    password: &str,
+    keyfile_path: Option<&Path>,
+    yubikey: Option<YubikeyConfig>,
+) -> anyhow::Result<(Database, DatabaseKey, Vec<Entry>)> {
+    let _operation = challenge_response::operation::Operation::standard();
+    challenge_response::operation::check()?;
     if path.exists() {
         anyhow::bail!("a file already exists at {}", path.display());
     }
@@ -207,17 +386,28 @@ pub fn create_database(
     }
 
     let db = Database::new();
-    let key = build_database_key(password, keyfile_path)?;
+    let key = build_database_key_with_yubikey(password, keyfile_path, yubikey)?;
 
     write_to_disk(path, &key, &db)?;
 
     Ok((db, key, Vec::new()))
 }
 
+#[cfg(test)]
 pub fn build_database_key(
     password: &str,
     keyfile_path: Option<&Path>,
 ) -> anyhow::Result<DatabaseKey> {
+    build_database_key_with_yubikey(password, keyfile_path, None)
+}
+
+pub fn build_database_key_with_yubikey(
+    password: &str,
+    keyfile_path: Option<&Path>,
+    yubikey: Option<YubikeyConfig>,
+) -> anyhow::Result<DatabaseKey> {
+    let _operation = challenge_response::operation::Operation::standard();
+    challenge_response::operation::check()?;
     let mut key = DatabaseKey::new().with_password(password);
 
     if let Some(path) = keyfile_path {
@@ -238,6 +428,43 @@ pub fn build_database_key(
             .with_context(|| format!("couldn't read keyfile {}", path.display()))?;
     }
 
+    if let Some(selection) = yubikey {
+        let selection = selection.validate()?;
+        #[cfg(test)]
+        if let Some(result) = crate::yubikey_test_backend::select(selection) {
+            return Ok(key.with_challenge_response_key(result?));
+        }
+        let device = keepass::ChallengeResponseKey::get_yubikey(Some(selection.serial))
+            .or_else(|error| {
+                use keepass::error::ChallengeResponseKeyError;
+                if matches!(
+                    error,
+                    ChallengeResponseKeyError::NoKeys | ChallengeResponseKeyError::KeyNotFound(_)
+                ) {
+                    // KeePass filters serial=None and erases access diagnostics.
+                    // Diagnose only its no-match result through explicit native
+                    // selection. Even if the token appeared meanwhile, do not
+                    // turn that failed selection into authentication success.
+                    challenge_response::ChallengeResponse::new()?
+                        .find_device_from_serial(selection.serial)?;
+                    anyhow::bail!("YubiKey availability changed during discovery; retry authentication with all factors");
+                }
+                Err(anyhow::Error::new(error))
+            })
+            .with_context(|| {
+                format!(
+                    "YubiKey serial {} slot {} unavailable (device discovery/access failed)",
+                    selection.serial, selection.slot
+                )
+            })?;
+        key = key.with_challenge_response_key(keepass::ChallengeResponseKey::YubikeyChallenge(
+            device,
+            selection.slot.to_string(),
+        ));
+    }
+    challenge_response::operation::check()?;
+    // Keep this original unperformed key. KDBX4 save/open challenge ephemeral
+    // clones using each container's fresh KDF seed, including independent reads.
     Ok(key)
 }
 
@@ -289,7 +516,7 @@ fn verify_saved_entries(path: &Path, key: &DatabaseKey, entries: &[Entry]) -> an
     let mut file = fs::File::open(path)
         .with_context(|| format!("couldn't reopen {} to verify the save", path.display()))?;
 
-    let reopened = Database::open(&mut file, key.clone())
+    let reopened = open_with_key(&mut file, key)
         .map_err(|err| anyhow::anyhow!("couldn't decrypt the saved database: {err}"))?;
 
     for entry in entries {
@@ -364,9 +591,11 @@ fn write_checked_receipt(
     verify: impl Fn(&Path) -> anyhow::Result<()>,
     revision: &mut Option<Revision>,
 ) -> Result<(), SaveError> {
+    let _operation = challenge_response::operation::Operation::standard();
+    challenge_response::operation::check().map_err(|e| SaveError::Write(e.into()))?;
     let (tmp_path, mut file) = create_staging_file(path).map_err(SaveError::Write)?;
     let result = (|| -> Result<(), SaveError> {
-        db.save(&mut file, key.clone())
+        save_with_key(db, &mut file, key)
             .map_err(|err| SaveError::Write(anyhow::anyhow!("failed to write database: {err}")))?;
         file.sync_all()
             .context("couldn't flush staged database")
@@ -385,6 +614,7 @@ fn write_checked_receipt(
             path: path.to_owned(),
             ciphertext: Sha256::digest(&bytes).into(),
         };
+        challenge_response::operation::check().map_err(|e| SaveError::Write(e.into()))?;
         fs::rename(&tmp_path, path)
             .context("couldn't replace database")
             .map_err(SaveError::Write)?;
@@ -400,7 +630,8 @@ fn write_checked_receipt(
             .map_err(SaveError::Verification)?;
         #[cfg(test)]
         test_fault::after_replace(path).map_err(SaveError::Verification)?;
-        verify(path).map_err(SaveError::Verification)
+        verify(path).map_err(SaveError::Verification)?;
+        challenge_response::operation::check().map_err(|e| SaveError::Verification(e.into()))
     })();
     // Remove only the unique file that this operation created.
     drop(file);
@@ -490,7 +721,7 @@ fn verify_entry_absent(path: &Path, key: &DatabaseKey, id: EntryId) -> anyhow::R
     let mut file = fs::File::open(path)
         .with_context(|| format!("couldn't reopen {} to verify the delete", path.display()))?;
 
-    let reopened = Database::open(&mut file, key.clone())
+    let reopened = open_with_key(&mut file, key)
         .map_err(|err| anyhow::anyhow!("couldn't decrypt the saved database: {err}"))?;
 
     if reopened.entry(id).is_some() {
@@ -576,6 +807,7 @@ pub mod test_fault {
     thread_local! {
         pub static FINAL: RefCell<Option<FinalCheck>> = const { RefCell::new(None) };
         pub static UNLOCK: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+        pub static CANCEL_UNLOCK: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> = const { RefCell::new(None) };
     }
     pub fn after_replace(path: &Path) -> anyhow::Result<()> {
         match FINAL.with(|next| next.borrow_mut().take()) {
@@ -588,6 +820,11 @@ pub mod test_fault {
         }
     }
     pub fn after_unlock(path: &Path) -> anyhow::Result<()> {
+        CANCEL_UNLOCK.with(|f| {
+            if let Some(f) = f.borrow_mut().take() {
+                f.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
         if let Some(bytes) = UNLOCK.with(|next| next.borrow_mut().take()) {
             std::fs::write(path, bytes)?;
         }

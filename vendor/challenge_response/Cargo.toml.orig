@@ -1,0 +1,45 @@
+[package]
+name = "challenge_response"
+version = "0.5.46"
+authors = ["Ashutosh Varma <github@ashu.io>", "louib <code@louib.net>"]
+edition = "2021"
+
+description = "Perform HMAC-SHA1 and OTP challenges with YubiKey, OnlyKey and NitroKey, in pure Rust."
+license = "MIT OR Apache-2.0"
+keywords = ["yubikey", "authentication", "encryption", "configuration", "challenge-response"]
+categories = ["authentication"]
+repository = "https://github.com/louib/challenge-response"
+readme = "README.md"
+
+include = [
+  "src/",
+  "README.md",
+  "LICENSE",
+]
+
+[lib]
+name = "challenge_response"
+path = "src/lib.rs"
+
+[features]
+rusb = ["dep:rusb"]
+nusb = ["dep:nusb"]
+default = ["rusb"]
+
+[dependencies]
+rand = "0.10"
+bitflags = "2.10"
+structure = "0.1"
+aes = "0.9"
+hmac = "0.13"
+sha1 = "0.11"
+
+[target.'cfg(windows)'.dependencies]
+rusb = { version = "0.9" }
+
+[target.'cfg(not(windows))'.dependencies]
+rusb = { version = "0.9", optional = true }
+nusb = { version = "0.2", optional = true }
+
+[dev-dependencies]
+hex = "0.4"

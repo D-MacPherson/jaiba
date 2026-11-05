@@ -180,6 +180,33 @@ impl Dir {
         verify: impl Fn(&mut File) -> anyhow::Result<()>,
         published: &mut Option<File>,
     ) -> anyhow::Result<()> {
+        self.atomic_with_check(name, write, verify, published, || {
+            challenge_response::operation::check()?;
+            Ok(())
+        })
+    }
+
+    /// Publish only nonsecret protocol metadata after credential revocation.
+    /// Duplicate lock signals must not cancel this write; all filesystem and
+    /// content verification below is identical to credential-bearing publication.
+    pub(crate) fn atomic_key_free(
+        &self,
+        name: &OsStr,
+        write: impl FnOnce(&mut File) -> anyhow::Result<()>,
+        verify: impl Fn(&mut File) -> anyhow::Result<()>,
+        published: &mut Option<File>,
+    ) -> anyhow::Result<()> {
+        self.atomic_with_check(name, write, verify, published, || Ok(()))
+    }
+
+    fn atomic_with_check(
+        &self,
+        name: &OsStr,
+        write: impl FnOnce(&mut File) -> anyhow::Result<()>,
+        verify: impl Fn(&mut File) -> anyhow::Result<()>,
+        published: &mut Option<File>,
+        check: impl Fn() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let (staging, mut file) = (0..100)
             .find_map(|_| {
@@ -214,6 +241,7 @@ impl Dir {
                 same(&meta, &self.open_file(&staging, u64::MAX)?.metadata()?),
                 "Staging identity changed"
             );
+            check()?;
             // SAFETY: live pinned directory and valid names; rename never follows target links.
             if unsafe {
                 libc::renameat(
@@ -234,6 +262,7 @@ impl Dir {
                 "Published identity changed"
             );
             verify(&mut actual)?;
+            check()?;
             Ok(())
         })();
         let _ = self.remove_owned(&staging, &meta);
@@ -281,6 +310,29 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn cancellation_after_staged_verification_never_publishes_success() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let root = Root::new();
+        let dir = Dir::open(&root.0, uid()).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let _cancel = challenge_response::operation::Cancellation::install(Arc::clone(&flag));
+        let mut published = None;
+        let result = dir.atomic(
+            OsStr::new("data"),
+            |f| Ok(f.write_all(b"synthetic encrypted staging")?),
+            |_| {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            &mut published,
+        );
+        assert!(result.is_err());
+        assert!(published.is_none());
+        assert!(!root.0.join("data").exists());
+        assert!(dir.names().unwrap().is_empty());
     }
 
     #[test]
