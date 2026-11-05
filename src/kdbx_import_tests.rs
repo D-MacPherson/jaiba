@@ -82,6 +82,80 @@ fn legacy_header(id: u8, width: usize) -> Vec<u8> {
 }
 
 #[test]
+fn authenticated_inner_stream_id_width_is_a_structured_error() {
+    let valid = keepass::credential_valid_kdbx4_with_inner_stream_id_width(PASSWORD, 4)
+        .expect("valid four-byte stream ID");
+    let key = keepass::DatabaseKey::new().with_password(PASSWORD);
+    let opened = keepass::Database::parse(&valid, key.clone()).expect("four-byte stream ID opens");
+    assert_eq!(opened.iter_all_entries().count(), 1);
+    assert_eq!(
+        opened.iter_all_entries().next().unwrap().get_title(),
+        Some("synthetic inner stream")
+    );
+    let valid_fixture = Fixture::new(&valid);
+    let imported = super::import_kdbx(&valid_fixture.0, PASSWORD).expect("valid import");
+    assert_eq!(imported[0].name, "synthetic inner stream");
+
+    for width in 0..4 {
+        let bytes = keepass::credential_valid_kdbx4_with_inner_stream_id_width(PASSWORD, width)
+            .unwrap_or_else(|err| panic!("fixture width {width}: {err}"));
+        let wrong = keepass::DatabaseKey::new().with_password("wrong synthetic password");
+        let wrong_open = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            keepass::Database::parse(&bytes, wrong)
+        }));
+        let wrong_open = wrong_open.expect("wrong password must not panic");
+        let wrong_err =
+            wrong_open.expect_err("wrong password is rejected at header authentication");
+        assert!(
+            !wrong_err.to_string().contains("stream ID"),
+            "wrong password reached the inner header: {wrong_err}"
+        );
+        let mut tampered = bytes.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        let tampered_open = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            keepass::Database::parse(&tampered, key.clone())
+        }));
+        assert!(
+            tampered_open
+                .expect("unauthenticated byte must not panic")
+                .is_err()
+        );
+
+        let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            keepass::Database::parse(&bytes, key.clone())
+        }));
+        let parsed = parsed.expect("short stream ID must not panic");
+        let err = parsed.expect_err("short stream ID must fail");
+        assert!(
+            err.to_string()
+                .contains("Invalid inner header stream ID length"),
+            "{err}"
+        );
+        let fixture = Fixture::new(&bytes);
+        let imported = std::panic::catch_unwind(|| super::import_kdbx(&fixture.0, PASSWORD));
+        let imported = imported.expect("import must not panic");
+        match imported {
+            Ok(_) => panic!("import must fail for width {width}"),
+            Err(import_err) => assert!(
+                import_err
+                    .to_string()
+                    .contains("Invalid inner header stream ID length"),
+                "{import_err:#}"
+            ),
+        }
+        let direct = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::db::open_with_key(&mut std::io::Cursor::new(bytes), &key)
+        }));
+        let direct = direct.expect("decrypt route must not panic");
+        assert!(
+            direct.is_err(),
+            "independent decrypt must reject width {width}"
+        );
+    }
+}
+
+#[test]
 fn malformed_legacy_scalars_return_import_error_without_unwinding() {
     // All fixed-width scalar reads in keepass 0.13.20's KDBX3 outer header.
     for (id, expected_width) in [(3, 4), (6, 8), (10, 4)] {

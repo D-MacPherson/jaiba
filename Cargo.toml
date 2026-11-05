@@ -37,9 +37,11 @@ challenge_response = { version = "=0.5.46", default-features = false, features =
 
 [patch.crates-io]
 challenge_response = { path = "vendor/challenge_response" }
+keepass = { path = "vendor/keepass" }
 
 [dev-dependencies]
 challenge_response = { version = "=0.5.46", default-features = false, features = ["nusb", "test-support"] }
+keepass = { version = "=0.13.20", features = ["save_kdbx4", "totp", "challenge_response", "test-support"] }
 
 [profile.release]
 strip = true
