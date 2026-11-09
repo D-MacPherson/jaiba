@@ -28,19 +28,26 @@ pub struct Yubikey {
 }
 
 impl ChallengeResponseKey {
-    pub(crate) fn perform_challenge(&self, challenge: &[u8]) -> Result<KeyElement, ChallengeResponseKeyError> {
+    pub(crate) fn perform_challenge(
+        &self,
+        challenge: &[u8],
+    ) -> Result<KeyElement, ChallengeResponseKeyError> {
         match self {
             ChallengeResponseKey::LocalChallenge(secret) => {
                 let secret_bytes = hex::decode(secret)?;
-                let response = crate::crypt::calculate_hmac_sha1(&[challenge], &secret_bytes)?.to_vec();
+                let response =
+                    crate::crypt::calculate_hmac_sha1(&[challenge], &secret_bytes)?.to_vec();
                 Ok(response)
             }
             ChallengeResponseKey::YubikeyChallenge(yubikey, slot_number) => {
+                let _operation = challenge_response::operation::Operation::standard();
                 let mut challenge_response_client = ChallengeResponse::new()?;
-                let slot = Slot::from_str(slot_number)
-                    .ok_or(ChallengeResponseKeyError::InvalidSlot(slot_number.to_string()))?;
+                let slot = Slot::from_str(slot_number).ok_or(
+                    ChallengeResponseKeyError::InvalidSlot(slot_number.to_string()),
+                )?;
 
-                let device = challenge_response_client.find_device_from_serial(yubikey.serial_number)?;
+                let device =
+                    challenge_response_client.select_authorized(&[yubikey.serial_number])?;
 
                 let mut config = Config::new_from(device);
                 config = config.set_variable_size(true);
@@ -48,7 +55,7 @@ impl ChallengeResponseKey {
                 config = config.set_slot(slot);
 
                 let key_element = challenge_response_client
-                    .challenge_response_hmac(challenge, config)?
+                    .challenge_response_hmac_pinned(challenge, config)?
                     .to_vec();
 
                 Ok(key_element)
@@ -67,11 +74,23 @@ impl ChallengeResponseKey {
                 let serial_number = device.serial?;
                 let name = device.name;
 
-                Some(Yubikey { serial_number, name })
+                Some(Yubikey {
+                    serial_number,
+                    name,
+                })
             })
             .collect();
 
         Ok(devices)
+    }
+
+    /// Explicit allowlist selection; actual USB claim is owned by the outer operation.
+    pub fn get_authorized_yubikey(serials: &[u32]) -> Result<Yubikey, ChallengeResponseKeyError> {
+        let device = ChallengeResponse::new()?.select_authorized(serials)?;
+        Ok(Yubikey {
+            serial_number: device.serial.ok_or(ChallengeResponseKeyError::NoKeys)?,
+            name: device.name,
+        })
     }
 
     /// Retrieves a specific Yubikey device based on the provided serial number.
@@ -102,7 +121,8 @@ impl ChallengeResponseKey {
                 return Err(ChallengeResponseKeyError::AmbiguousKeys);
             }
 
-            #[allow(clippy::indexing_slicing)] // Safe because we check that the list is not empty above
+            #[allow(clippy::indexing_slicing)]
+            // Safe because we check that the list is not empty above
             Ok(devices[0].clone())
         }
     }

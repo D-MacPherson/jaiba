@@ -26,7 +26,10 @@ pub mod operation;
 pub mod otpmode;
 mod sec;
 #[cfg(feature = "test-support")]
+mod test_sessions;
+#[cfg(feature = "test-support")]
 pub mod test_support;
+pub mod touch;
 mod usb;
 
 use aes::cipher::Block;
@@ -63,6 +66,22 @@ impl ChallengeResponse {
         let result = self.backend.find_device();
         operation::native()?;
         result
+    }
+
+    /// Pin an explicitly authorized physical device for the active outer operation.
+    /// Unsupported backends fail closed rather than silently using serial-only reopen.
+    pub fn select_authorized(&mut self, serials: &[u32]) -> Result<Device> {
+        let _operation = operation::Operation::standard();
+        operation::native()?;
+        #[cfg(all(feature = "nusb", not(feature = "rusb"), not(target_os = "windows")))]
+        {
+            self.backend.select_authorized(serials)
+        }
+        #[cfg(not(all(feature = "nusb", not(feature = "rusb"), not(target_os = "windows"))))]
+        {
+            let _ = serials;
+            Err(ChallengeResponseError::UnsupportedInterface)
+        }
     }
 
     pub fn find_device_from_serial(&mut self, serial: u32) -> Result<Device> {
@@ -114,48 +133,29 @@ impl ChallengeResponse {
         if chall.is_empty() || chall.len() > CHALLENGE_SIZE {
             return Err(ChallengeResponseError::InvalidChallenge);
         }
-        let mut hmac = Hmac([0; 20]);
-
         self.backend.with_device(
             conf.device.bus_id,
             conf.device.address_id,
-            |backend, handle| {
-                let mut challenge = [0; CHALLENGE_SIZE];
-
-                if conf.variable && chall.last() == Some(&0) {
-                    challenge = [0xff; CHALLENGE_SIZE];
-                }
-
-                let mut command = Command::ChallengeHmac1;
-                if let Slot::Slot2 = conf.slot {
-                    command = Command::ChallengeHmac2;
-                }
-
-                (&mut challenge[..chall.len()]).copy_from_slice(chall);
-                let d = Frame::new(challenge, command);
-                let mut buf = [0; usb::STATUS_UPDATE_PAYLOAD_SIZE];
-                backend.wait(
-                    handle,
-                    |f| !f.contains(usb::Flags::SLOT_WRITE_FLAG),
-                    &mut buf,
-                )?;
-
-                backend.write_frame(handle, &d)?;
-
-                // Read the response.
-                let mut response = [0; usb::RESPONSE_SIZE];
-                backend.read_response(handle, &mut response)?;
-
-                // Check response.
-                if crc16(&response[..22]) != CRC_RESIDUAL_OK {
-                    return Err(ChallengeResponseError::WrongCRC);
-                }
-
-                hmac.0.clone_from_slice(&response[..20]);
-
-                Ok(hmac)
-            },
+            |backend, handle| backend.hmac(handle, chall, &conf),
         )
+    }
+
+    /// HMAC on the exact handle whose serial was authorized in this operation.
+    pub fn challenge_response_hmac_pinned(&mut self, chall: &[u8], conf: Config) -> Result<Hmac> {
+        let _operation = operation::Operation::standard();
+        operation::native()?;
+        if chall.is_empty() || chall.len() > CHALLENGE_SIZE {
+            return Err(ChallengeResponseError::InvalidChallenge);
+        }
+        #[cfg(all(feature = "nusb", not(feature = "rusb"), not(target_os = "windows")))]
+        {
+            self.backend.pinned_hmac(chall, &conf)
+        }
+        #[cfg(not(all(feature = "nusb", not(feature = "rusb"), not(target_os = "windows"))))]
+        {
+            let _ = conf;
+            Err(ChallengeResponseError::UnsupportedInterface)
+        }
     }
 
     pub fn challenge_response_otp(&mut self, chall: &[u8], conf: Config) -> Result<Aes128Block> {

@@ -1,4 +1,17 @@
 //! Synthetic I/O exercising production discovery and protocol logic. No USB.
+pub use crate::test_sessions::{Event, Sessions};
+
+/// Drive only the presentation notification seam, without device I/O.
+pub fn touch_wait_reports(statuses: &[u8]) {
+    let _wait = crate::touch::ResponseWait::new();
+    for status in statuses {
+        crate::touch::status(*status);
+    }
+}
+
+pub fn touch_status_outside_response(status: u8) {
+    crate::touch::status(status);
+}
 use std::{
     cell::RefCell,
     sync::{
@@ -22,7 +35,7 @@ pub enum SerialRead {
     Sequence(std::rc::Rc<Cell<usize>>, Vec<SerialRead>),
 }
 impl SerialRead {
-    fn result(&self) -> Result<u32, ChallengeResponseError> {
+    pub(crate) fn result(&self) -> Result<u32, ChallengeResponseError> {
         match self {
             Self::Serial(serial) => Ok(*serial),
             Self::Sequence(next, values) => {
@@ -87,6 +100,9 @@ impl Drop for Discovery {
     }
 }
 pub(crate) fn discovery_devices() -> Option<Result<Vec<Device>, ChallengeResponseError>> {
+    if let Some(devices) = crate::test_sessions::candidates() {
+        return Some(Ok(devices));
+    }
     DISCOVERY.with(|s| {
         s.borrow().as_ref().map(|io| {
             if let Some(action) = &io.enumeration {
@@ -109,6 +125,9 @@ pub(crate) fn discovery_devices() -> Option<Result<Vec<Device>, ChallengeRespons
     })
 }
 pub(crate) fn discovery_serial(address: u8) -> Option<Result<u32, ChallengeResponseError>> {
+    if let Some(handle) = crate::test_sessions::open(address) {
+        return Some(handle.and_then(|h| h.serial()));
+    }
     DISCOVERY.with(|s| {
         s.borrow()
             .as_ref()
@@ -116,6 +135,19 @@ pub(crate) fn discovery_serial(address: u8) -> Option<Result<u32, ChallengeRespo
     })
 }
 /// Invoke the production backend directly too, without the public wrapper's final check.
+pub(crate) fn discovery_handle(
+    address: u8,
+) -> Option<Result<crate::test_sessions::Handle, ChallengeResponseError>> {
+    crate::test_sessions::open(address).or_else(|| {
+        DISCOVERY.with(|s| {
+            s.borrow().as_ref().map(|io| {
+                Ok(crate::test_sessions::discovery(
+                    io.reads[address as usize].clone(),
+                ))
+            })
+        })
+    })
+}
 pub fn backend_discovery(serial: Option<u32>) -> Result<Vec<Device>, ChallengeResponseError> {
     let mut backend = crate::usb::nusb::NUSBBackend::new()?;
     match serial {
@@ -129,12 +161,14 @@ use crate::{
 };
 use std::{cell::Cell, time::Duration};
 
-struct Stalled {
+struct Stalled<'a> {
     reads: Cell<usize>,
     delay: Duration,
     limit: usize,
+    status: Cell<u8>,
+    on_second_read: Option<&'a dyn Fn() -> Result<(), ChallengeResponseError>>,
 }
-impl Backend<(), ()> for Stalled {
+impl Backend<(), ()> for Stalled<'_> {
     fn new() -> Result<Self, ChallengeResponseError> {
         unreachable!()
     }
@@ -146,11 +180,19 @@ impl Backend<(), ()> for Stalled {
     }
     fn read(&self, _: &mut (), buf: &mut [u8]) -> Result<usize, ChallengeResponseError> {
         self.reads.set(self.reads.get() + 1);
+        if self.reads.get() == 2 {
+            if let Some(action) = self.on_second_read {
+                action()?;
+                crate::operation::native()?;
+                self.status.set(0x40);
+            }
+        }
         if self.reads.get() >= self.limit {
             return Err(ChallengeResponseError::CanNotReadFromDevice);
         }
         std::thread::sleep(self.delay);
         buf.fill(0);
+        buf[7] = self.status.get();
         Ok(buf.len())
     }
     fn raw_write(&self, _: &mut (), _: &[u8]) -> Result<(), ChallengeResponseError> {
@@ -304,6 +346,8 @@ pub fn stalled_wait(delay: Duration, limit: usize) -> (Result<(), ChallengeRespo
         reads: Cell::new(0),
         delay,
         limit,
+        status: Cell::new(0),
+        on_second_read: None,
     };
     let result = backend.wait(
         &mut (),
@@ -311,4 +355,25 @@ pub fn stalled_wait(delay: Duration, limit: usize) -> (Result<(), ChallengeRespo
         &mut [0; 8],
     );
     (result, backend.reads.get())
+}
+
+/// Replay an OTP touch keepalive through the production polling loop. The
+/// callback can block until the UI has actually flushed, then release the wait.
+pub fn touch_wait_for(
+    status: u8,
+    action: impl Fn() -> Result<(), ChallengeResponseError>,
+) -> Result<(), ChallengeResponseError> {
+    let backend = Stalled {
+        reads: Cell::new(0),
+        delay: Duration::ZERO,
+        limit: usize::MAX,
+        status: Cell::new(status),
+        on_second_read: Some(&action),
+    };
+    let _wait = crate::touch::ResponseWait::new();
+    backend.wait(
+        &mut (),
+        |f| f.contains(Flags::RESP_PENDING_FLAG),
+        &mut [0; 8],
+    )
 }

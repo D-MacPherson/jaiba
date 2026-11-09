@@ -8,8 +8,8 @@ use crate::config::save_config;
 #[cfg(test)]
 use crate::db::unlock_database;
 use crate::db::{
-    Entry, SaveError, build_database_key_with_yubikey, calculate_warnings, save_database,
-    unlock_database_snapshot_with_yubikey,
+    Entry, SaveError, build_database_key_with_policy, calculate_warnings, save_database,
+    unlock_database_snapshot_with_policy,
 };
 use crate::theme::load_theme;
 use crate::util::expand_tilde;
@@ -26,6 +26,7 @@ pub const IMPORT_ROW: usize = 6;
 pub const EXPORT_ROW: usize = 7;
 
 pub fn handle_settings_input(app: &mut App, key: KeyCode) {
+    let _operation = challenge_response::operation::Operation::standard();
     if app.exporting_database {
         handle_export_input(app, key);
         return;
@@ -283,7 +284,7 @@ fn verify_current_password(app: &mut App) {
         return;
     };
 
-    match unlock_database_snapshot_with_yubikey(
+    match unlock_database_snapshot_with_policy(
         &path,
         &app.current_password_buffer,
         app.database_keyfile(),
@@ -334,7 +335,7 @@ fn commit_password_change(app: &mut App) {
 
     #[cfg(test)]
     crate::recovery::interleave::before_rekey();
-    let new_key = match build_database_key_with_yubikey(
+    let new_key = match build_database_key_with_policy(
         &app.new_password_buffer,
         app.database_keyfile(),
         app.database_yubikey(),

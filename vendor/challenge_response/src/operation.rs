@@ -17,6 +17,8 @@ pub const TRANSFER_TIMEOUT: Duration = Duration::from_millis(100);
 struct State {
     deadline: Instant,
     native: Rc<Cell<bool>>,
+    #[cfg(all(feature = "nusb", not(feature = "rusb"), not(target_os = "windows")))]
+    session: Rc<RefCell<crate::usb::nusb::PinState>>,
 }
 thread_local! {
     static ACTIVE: RefCell<Option<State>> = const { RefCell::new(None) };
@@ -35,7 +37,17 @@ impl Operation {
                 || (deadline, Rc::new(Cell::new(false))),
                 |p| (p.deadline.min(deadline), Rc::clone(&p.native)),
             );
-            s.replace(Some(State { deadline, native }))
+            #[cfg(all(feature = "nusb", not(feature = "rusb"), not(target_os = "windows")))]
+            let session = s.borrow().as_ref().map_or_else(
+                || Rc::new(RefCell::new(crate::usb::nusb::PinState::default())),
+                |p| Rc::clone(&p.session),
+            );
+            s.replace(Some(State {
+                deadline,
+                native,
+                #[cfg(all(feature = "nusb", not(feature = "rusb"), not(target_os = "windows")))]
+                session,
+            }))
         });
         Self {
             previous,
@@ -53,6 +65,13 @@ impl Drop for Operation {
         });
     }
 }
+#[cfg(all(feature = "nusb", not(feature = "rusb"), not(target_os = "windows")))]
+pub(crate) fn session() -> Result<Rc<RefCell<crate::usb::nusb::PinState>>, ChallengeResponseError> {
+    ACTIVE
+        .with(|s| s.borrow().as_ref().map(|s| Rc::clone(&s.session)))
+        .ok_or(ChallengeResponseError::OpenDeviceError)
+}
+
 /// Install a signal-handler-owned atomic. Only the coordinator consumes it.
 pub struct Cancellation {
     previous: Option<Arc<AtomicBool>>,

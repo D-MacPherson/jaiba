@@ -76,7 +76,7 @@ pub struct App {
     pub primary_revision: Option<crate::db::Revision>,
     pub open_database: Option<PathBuf>,
     pub open_keyfile: Option<PathBuf>,
-    pub open_yubikey: Option<crate::config::YubikeyConfig>,
+    pub open_yubikey: Option<crate::config::YubikeyPolicy>,
     pub pending_draft: Option<crate::recovery::Draft>,
     pub draft_slot: Option<crate::recovery::Slot>,
     pub draft_durable: bool,
@@ -281,11 +281,11 @@ impl App {
         }
     }
 
-    pub fn database_yubikey(&self) -> Option<crate::config::YubikeyConfig> {
+    pub fn database_yubikey(&self) -> Option<crate::config::YubikeyPolicy> {
         if self.open_database.is_some() {
-            self.open_yubikey
+            self.open_yubikey.clone()
         } else {
-            self.config.yubikey
+            self.config.yubikey.clone()
         }
     }
 
@@ -322,7 +322,7 @@ impl App {
         if self.open_database.is_none() {
             self.open_database = self.config.default_database.clone();
             self.open_keyfile = self.config.keyfile.clone();
-            self.open_yubikey = self.config.yubikey;
+            self.open_yubikey = self.config.yubikey.clone();
         }
         if let Some(draft) = self.pending_draft.clone() {
             if crate::recovery::persist(self, &draft).is_ok() {
@@ -515,19 +515,22 @@ pub fn run(
                 }
             }
         }
-        terminal.draw(|frame| {
-            frame.render_widget(
-                Block::default().style(Style::default().bg(app.theme.background)),
-                frame.area(),
-            );
+        let background = terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(app.theme.background)),
+                    frame.area(),
+                );
 
-            match app.screen {
-                Screen::Login => draw_login(frame, &mut app),
-                Screen::Index => draw_index(frame, &mut app),
-                Screen::Edit => draw_edit(frame, &mut app),
-                Screen::Settings => draw_settings(frame, &mut app),
-            }
-        })?;
+                match app.screen {
+                    Screen::Login => draw_login(frame, &mut app),
+                    Screen::Index => draw_index(frame, &mut app),
+                    Screen::Edit => draw_edit(frame, &mut app),
+                    Screen::Settings => draw_settings(frame, &mut app),
+                }
+            })?
+            .buffer
+            .clone();
 
         if event::poll(TICK_RATE)? {
             if registration.as_ref().is_some_and(|r| r.pending()) {
@@ -540,12 +543,19 @@ pub fn run(
                 app.last_activity = Instant::now();
 
                 let _operation = challenge_response::operation::Operation::standard();
-                match app.screen {
-                    Screen::Login => handle_login_input(&mut app, key.code),
-                    Screen::Index => handle_index_input(&mut app, key),
-                    Screen::Edit => handle_edit_input(&mut app, key.code),
-                    Screen::Settings => handle_settings_input(&mut app, key.code),
-                }
+                crate::ui::touch::with_prompt(
+                    terminal,
+                    background,
+                    Style::default()
+                        .fg(app.theme.warning)
+                        .bg(app.theme.background),
+                    || match app.screen {
+                        Screen::Login => handle_login_input(&mut app, key.code),
+                        Screen::Index => handle_index_input(&mut app, key),
+                        Screen::Edit => handle_edit_input(&mut app, key.code),
+                        Screen::Settings => handle_settings_input(&mut app, key.code),
+                    },
+                )?;
             }
         }
 

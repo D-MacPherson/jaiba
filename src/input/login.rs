@@ -5,7 +5,7 @@ use crossterm::event::KeyCode;
 use crate::app::{App, Screen};
 use crate::config::save_config;
 use crate::db::{
-    calculate_warnings, create_database_with_yubikey, unlock_database_snapshot_with_yubikey,
+    calculate_warnings, create_database_with_policy, unlock_database_snapshot_with_policy,
 };
 use crate::util::default_new_database_path;
 
@@ -14,6 +14,8 @@ use crate::util::default_new_database_path;
 mod cancellation_tests;
 
 pub fn handle_login_input(app: &mut App, key: KeyCode) {
+    // Direct callers and the event loop share the entire create/unlock/install/recovery scope.
+    let _operation = challenge_response::operation::Operation::standard();
     if (key == KeyCode::Esc || app.creating_database || database_missing(app))
         && app.protect_memory_draft()
     {
@@ -159,17 +161,22 @@ fn finish_create_database(app: &mut App) {
         return;
     }
 
-    let yubikey = app.config.yubikey;
-    match create_database_with_yubikey(&path, &app.password, app.config.keyfile.as_deref(), yubikey)
-        .and_then(|_| {
-            unlock_database_snapshot_with_yubikey(
-                &path,
-                &app.password,
-                app.config.keyfile.as_deref(),
-                yubikey,
-            )
-            .map_err(|err| anyhow::Error::new(crate::db::SaveError::Verification(err)))
-        }) {
+    let yubikey = app.config.yubikey.clone();
+    match create_database_with_policy(
+        &path,
+        &app.password,
+        app.config.keyfile.as_deref(),
+        yubikey.clone(),
+    )
+    .and_then(|_| {
+        unlock_database_snapshot_with_policy(
+            &path,
+            &app.password,
+            app.config.keyfile.as_deref(),
+            yubikey.clone(),
+        )
+        .map_err(|err| anyhow::Error::new(crate::db::SaveError::Verification(err)))
+    }) {
         Ok((db, key, entries, revision)) => {
             app.config.default_database = Some(path.clone());
             let save_result = save_config(&app.config);
@@ -261,7 +268,12 @@ fn attempt_unlock(app: &mut App) {
         app.config.keyfile.clone()
     };
     let yubikey = app.database_yubikey();
-    match unlock_database_snapshot_with_yubikey(&path, &app.password, keyfile.as_deref(), yubikey) {
+    match unlock_database_snapshot_with_policy(
+        &path,
+        &app.password,
+        keyfile.as_deref(),
+        yubikey.clone(),
+    ) {
         Ok((db, key, mut entries, revision)) => {
             calculate_warnings(&mut entries);
             #[cfg(test)]

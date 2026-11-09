@@ -7,7 +7,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::config::YubikeyConfig;
+use crate::config::{YubikeyConfig, YubikeyPolicy};
 use anyhow::Context;
 use chrono::Utc;
 use keepass::db::{EntryId, EntryMut, EntryRef, Times, fields};
@@ -296,6 +296,15 @@ pub fn unlock_database_snapshot_with_yubikey(
     keyfile_path: Option<&Path>,
     yubikey: Option<YubikeyConfig>,
 ) -> anyhow::Result<(Database, DatabaseKey, Vec<Entry>, Revision)> {
+    unlock_database_snapshot_with_policy(path, password, keyfile_path, yubikey.map(Into::into))
+}
+
+pub fn unlock_database_snapshot_with_policy(
+    path: &Path,
+    password: &str,
+    keyfile_path: Option<&Path>,
+    yubikey: Option<YubikeyPolicy>,
+) -> anyhow::Result<(Database, DatabaseKey, Vec<Entry>, Revision)> {
     let _operation = challenge_response::operation::Operation::standard();
     challenge_response::operation::check()?;
     let path = fs::canonicalize(path)?;
@@ -312,7 +321,7 @@ pub fn unlock_database_snapshot_with_yubikey(
         );
         preflight_kdbx4_header(&bytes, true)?;
     }
-    let key = build_database_key_with_yubikey(password, keyfile_path, yubikey)?;
+    let key = build_database_key_with_policy(password, keyfile_path, yubikey.clone())?;
     let db = open_with_key(&mut std::io::Cursor::new(&bytes), &key).map_err(|err| {
         anyhow::anyhow!(
             "unlock failed with password{}{}: {err}",
@@ -368,11 +377,21 @@ pub fn create_database(
     create_database_with_yubikey(path, password, keyfile_path, None)
 }
 
+#[cfg(test)]
 pub fn create_database_with_yubikey(
     path: &Path,
     password: &str,
     keyfile_path: Option<&Path>,
     yubikey: Option<YubikeyConfig>,
+) -> anyhow::Result<(Database, DatabaseKey, Vec<Entry>)> {
+    create_database_with_policy(path, password, keyfile_path, yubikey.map(Into::into))
+}
+
+pub fn create_database_with_policy(
+    path: &Path,
+    password: &str,
+    keyfile_path: Option<&Path>,
+    yubikey: Option<YubikeyPolicy>,
 ) -> anyhow::Result<(Database, DatabaseKey, Vec<Entry>)> {
     let _operation = challenge_response::operation::Operation::standard();
     challenge_response::operation::check()?;
@@ -386,7 +405,7 @@ pub fn create_database_with_yubikey(
     }
 
     let db = Database::new();
-    let key = build_database_key_with_yubikey(password, keyfile_path, yubikey)?;
+    let key = build_database_key_with_policy(password, keyfile_path, yubikey.clone())?;
 
     write_to_disk(path, &key, &db)?;
 
@@ -401,10 +420,19 @@ pub fn build_database_key(
     build_database_key_with_yubikey(password, keyfile_path, None)
 }
 
+#[cfg(test)]
 pub fn build_database_key_with_yubikey(
     password: &str,
     keyfile_path: Option<&Path>,
     yubikey: Option<YubikeyConfig>,
+) -> anyhow::Result<DatabaseKey> {
+    build_database_key_with_policy(password, keyfile_path, yubikey.map(Into::into))
+}
+
+pub fn build_database_key_with_policy(
+    password: &str,
+    keyfile_path: Option<&Path>,
+    yubikey: Option<YubikeyPolicy>,
 ) -> anyhow::Result<DatabaseKey> {
     let _operation = challenge_response::operation::Operation::standard();
     challenge_response::operation::check()?;
@@ -431,32 +459,16 @@ pub fn build_database_key_with_yubikey(
     if let Some(selection) = yubikey {
         let selection = selection.validate()?;
         #[cfg(test)]
-        if let Some(result) = crate::yubikey_test_backend::select(selection) {
-            return Ok(key.with_challenge_response_key(result?));
+        if selection.serials.len() == 1 {
+            if let Some(result) = crate::yubikey_test_backend::select(YubikeyConfig {
+                slot: selection.slot,
+                serial: selection.serials[0],
+            }) {
+                return Ok(key.with_challenge_response_key(result?));
+            }
         }
-        let device = keepass::ChallengeResponseKey::get_yubikey(Some(selection.serial))
-            .or_else(|error| {
-                use keepass::error::ChallengeResponseKeyError;
-                if matches!(
-                    error,
-                    ChallengeResponseKeyError::NoKeys | ChallengeResponseKeyError::KeyNotFound(_)
-                ) {
-                    // KeePass filters serial=None and erases access diagnostics.
-                    // Diagnose only its no-match result through explicit native
-                    // selection. Even if the token appeared meanwhile, do not
-                    // turn that failed selection into authentication success.
-                    challenge_response::ChallengeResponse::new()?
-                        .find_device_from_serial(selection.serial)?;
-                    anyhow::bail!("YubiKey availability changed during discovery; retry authentication with all factors");
-                }
-                Err(anyhow::Error::new(error))
-            })
-            .with_context(|| {
-                format!(
-                    "YubiKey serial {} slot {} unavailable (device discovery/access failed)",
-                    selection.serial, selection.slot
-                )
-            })?;
+        let device = keepass::ChallengeResponseKey::get_authorized_yubikey(&selection.serials)
+            .with_context(|| format!("YubiKey authorized serials {:?} slot {} unavailable (device discovery/access failed)", selection.serials, selection.slot))?;
         key = key.with_challenge_response_key(keepass::ChallengeResponseKey::YubikeyChallenge(
             device,
             selection.slot.to_string(),

@@ -17,18 +17,72 @@ pub struct YubikeyConfig {
     pub serial: u32,
 }
 
-impl YubikeyConfig {
+/// Frozen authorization policy, distinct from the concrete device retained in a key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct YubikeyPolicy {
+    pub slot: u8,
+    pub serials: Vec<u32>,
+}
+
+impl From<YubikeyConfig> for YubikeyPolicy {
+    fn from(device: YubikeyConfig) -> Self {
+        Self {
+            slot: device.slot,
+            serials: vec![device.serial],
+        }
+    }
+}
+
+impl YubikeyPolicy {
     pub fn validate(self) -> anyhow::Result<Self> {
         anyhow::ensure!(matches!(self.slot, 1 | 2), "yubikey.slot must be 1 or 2");
-        anyhow::ensure!(self.serial != 0, "yubikey.serial must be a nonzero u32");
+        anyhow::ensure!(
+            !self.serials.is_empty(),
+            "yubikey.serials must not be empty"
+        );
+        let mut sorted = self.serials.clone();
+        sorted.sort_unstable();
+        anyhow::ensure!(sorted[0] != 0, "yubikey serials must be nonzero u32 values");
+        anyhow::ensure!(
+            !sorted.windows(2).any(|pair| pair[0] == pair[1]),
+            "duplicate yubikey serial"
+        );
         Ok(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for YubikeyPolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            slot: u8,
+            serial: Option<u32>,
+            serials: Option<Vec<u32>>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let serials = match (raw.serial, raw.serials) {
+            (Some(serial), None) => vec![serial],
+            (None, Some(serials)) => serials,
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "specify exactly one of yubikey.serial or yubikey.serials",
+                ));
+            }
+        };
+        Self {
+            slot: raw.slot,
+            serials,
+        }
+        .validate()
+        .map_err(serde::de::Error::custom)
     }
 }
 
 pub struct Config {
     pub default_database: Option<PathBuf>,
     pub keyfile: Option<PathBuf>,
-    pub yubikey: Option<YubikeyConfig>,
+    pub yubikey: Option<YubikeyPolicy>,
     pub auto_lock: Duration,
     pub clipboard_timeout: Duration,
     pub theme: Option<String>,
@@ -52,7 +106,7 @@ impl Default for Config {
 struct ConfigFile {
     default_database: Option<String>,
     keyfile: Option<String>,
-    yubikey: Option<YubikeyConfig>,
+    yubikey: Option<YubikeyPolicy>,
     auto_lock: Option<u64>,
     clipboard_timeout: Option<u64>,
     theme: Option<String>,
@@ -84,7 +138,7 @@ fn parse_config(text: &str) -> anyhow::Result<Config> {
     Ok(Config {
         default_database: raw.default_database.map(|s| expand_tilde(&s)),
         keyfile: raw.keyfile.map(|s| expand_tilde(&s)),
-        yubikey: raw.yubikey.map(YubikeyConfig::validate).transpose()?,
+        yubikey: raw.yubikey.map(YubikeyPolicy::validate).transpose()?,
         auto_lock: raw
             .auto_lock
             .map(Duration::from_secs)
@@ -101,7 +155,7 @@ fn parse_config(text: &str) -> anyhow::Result<Config> {
 struct ConfigFileOut<'a> {
     default_database: Option<String>,
     keyfile: Option<String>,
-    yubikey: Option<YubikeyConfig>,
+    yubikey: Option<YubikeyPolicy>,
     auto_lock: u64,
     clipboard_timeout: u64,
     theme: Option<&'a str>,
@@ -129,7 +183,11 @@ fn serialize_config(config: &Config) -> anyhow::Result<String> {
             .as_ref()
             .map(|p| p.display().to_string()),
         keyfile: config.keyfile.as_ref().map(|p| p.display().to_string()),
-        yubikey: config.yubikey.map(YubikeyConfig::validate).transpose()?,
+        yubikey: config
+            .yubikey
+            .clone()
+            .map(YubikeyPolicy::validate)
+            .transpose()?,
         auto_lock: config.auto_lock.as_secs(),
         clipboard_timeout: config.clipboard_timeout.as_secs(),
         theme: config.theme.as_deref(),
@@ -142,6 +200,36 @@ fn serialize_config(config: &Config) -> anyhow::Result<String> {
 mod tests {
     use super::{Config, parse_config, serialize_config};
     use std::path::PathBuf;
+
+    #[test]
+    fn explicit_multi_device_policy_roundtrips_without_expanding_legacy_serial() {
+        let config = parse_config("[yubikey]\nslot = 2\nserials = [39269828, 39269826]")
+            .expect("explicit authorized serial list must parse");
+        let saved = serialize_config(&config).unwrap();
+        assert!(saved.contains("serials"));
+        assert_eq!(parse_config(&saved).unwrap().yubikey, config.yubikey);
+        let legacy = parse_config("[yubikey]\nslot = 2\nserial = 39269826").unwrap();
+        assert!(!serialize_config(&legacy).unwrap().contains("39269828"));
+    }
+
+    #[test]
+    fn multi_device_policy_rejects_mixed_empty_duplicate_zero_and_wrong_types() {
+        for text in [
+            "[yubikey]\nslot=2\nserials=[]",
+            "[yubikey]\nslot=2\nserials=[39269826,39269826]",
+            "[yubikey]\nslot=2\nserials=[39269826,0]",
+            "[yubikey]\nslot=2\nserials=[39269826,-1]",
+            "[yubikey]\nslot=2\nserials=[4294967296]",
+            "[yubikey]\nslot=2\nserials=[\"39269826\"]",
+            "[yubikey]\nslot=2\nserials=39269826",
+            "[yubikey]\nslot=2\nserial=39269826\nserials=[39269828]",
+            "[yubikey]\nslot=3\nserials=[39269826,39269828]",
+            "[yubikey]\nslot=\"2\"\nserials=[39269826,39269828]",
+            "[yubikey]\nserials=[39269826,39269828]",
+        ] {
+            assert!(parse_config(text).is_err(), "must reject {text:?}");
+        }
+    }
 
     #[test]
     fn yubikey_config_rejects_partial_invalid_or_misspelled_selection() {

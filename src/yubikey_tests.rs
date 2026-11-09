@@ -3,6 +3,10 @@
 mod discovery;
 #[path = "yubikey_hardware_tests.rs"]
 mod hardware;
+#[path = "yubikey_multi_tests.rs"]
+mod multi;
+#[path = "yubikey_multi_hardware_tests.rs"]
+mod multi_hardware;
 use crate::app::{App, Screen};
 use crate::config::YubikeyConfig;
 use crate::{db, input};
@@ -51,7 +55,7 @@ fn synthetic_app(f: &Fixture, keyfile: Option<PathBuf>) -> App {
     db::save_database(&f.path(), &key, &mut database, &mut []).unwrap();
     let mut app = App::for_test(Some(f.path()));
     app.screen = Screen::Login;
-    app.config.yubikey = Some(TOKEN);
+    app.config.yubikey = Some(TOKEN.into());
     app.config.keyfile = keyfile;
     authenticate(&mut app, "synthetic master");
     assert_eq!(app.screen, Screen::Index, "{:?}", app.login_error);
@@ -465,7 +469,7 @@ fn creation_receipt_distinguishes_uncommitted_and_committed_unverified() {
         let f = Fixture::new();
         let mut app = App::for_test(Some(f.path()));
         app.screen = Screen::Login;
-        app.config.yubikey = Some(TOKEN);
+        app.config.yubikey = Some(TOKEN.into());
         input::login::handle_login_input(&mut app, KeyCode::Char('n'));
         app.password = "synthetic master".into();
         input::login::handle_login_input(&mut app, KeyCode::Enter);
@@ -581,7 +585,7 @@ fn create_handler_preserves_all_configured_factors() {
     fs::write(&keyfile, b"synthetic creation keyfile").unwrap();
     let mut app = App::for_test(Some(f.path()));
     app.screen = Screen::Login;
-    app.config.yubikey = Some(TOKEN);
+    app.config.yubikey = Some(TOKEN.into());
     app.config.keyfile = Some(keyfile.clone());
     input::login::handle_login_input(&mut app, KeyCode::Char('n'));
     app.password = "synthetic master".into();
@@ -593,7 +597,7 @@ fn create_handler_preserves_all_configured_factors() {
         db::unlock_database(&f.path(), "synthetic master", Some(&keyfile)).is_err(),
         "new vault must require hardware"
     );
-    assert_eq!(app.database_yubikey(), Some(TOKEN));
+    assert_eq!(app.database_yubikey(), Some(TOKEN.into()));
     assert!(app.lock_cooperatively());
     app.config.yubikey = None;
     authenticate(&mut app, "synthetic master");
@@ -728,14 +732,14 @@ fn full_factor_sidecars_survive_restart_and_refuse_wrong_selection() {
         let mut restarted = App::for_test(Some(f.path()));
         restarted.screen = Screen::Login;
         restarted.config.keyfile = Some(keyfile.clone());
-        restarted.config.yubikey = Some(selection);
+        restarted.config.yubikey = Some(selection.into());
         authenticate(&mut restarted, "synthetic master");
         assert_eq!(restarted.screen, Screen::Login);
     }
     let mut restarted = App::for_test(Some(f.path()));
     restarted.screen = Screen::Login;
     restarted.config.keyfile = Some(keyfile);
-    restarted.config.yubikey = Some(TOKEN);
+    restarted.config.yubikey = Some(TOKEN.into());
     authenticate(&mut restarted, "synthetic master");
     assert_eq!(
         restarted.screen,
@@ -923,7 +927,7 @@ fn oversized_untrusted_kdf_seed_is_rejected_before_hardware_access() {
     fs::write(f.path(), header).unwrap();
     let mut app = App::for_test(Some(f.path()));
     app.screen = Screen::Login;
-    app.config.yubikey = Some(TOKEN);
+    app.config.yubikey = Some(TOKEN.into());
     authenticate(&mut app, "synthetic master");
     assert_eq!(app.screen, Screen::Login);
     assert!(
@@ -944,7 +948,7 @@ fn hardware_rejects_legacy_formats_before_device_discovery() {
         fs::write(f.path(), header).unwrap();
         let mut app = App::for_test(Some(f.path()));
         app.screen = Screen::Login;
-        app.config.yubikey = Some(TOKEN);
+        app.config.yubikey = Some(TOKEN.into());
         authenticate(&mut app, "synthetic master");
         assert_eq!(app.screen, Screen::Login);
         assert!(
@@ -962,7 +966,7 @@ fn configured_hardware_never_falls_back_to_password_only() {
     db::create_database(&f.path(), "synthetic master", None).unwrap();
     let mut app = App::for_test(Some(f.path()));
     app.screen = Screen::Login;
-    app.config.yubikey = Some(TOKEN);
+    app.config.yubikey = Some(TOKEN.into());
     authenticate(&mut app, "synthetic master");
     assert_eq!(
         app.screen,

@@ -38,6 +38,95 @@ fn discover(route: usize) -> Result<(), String> {
 }
 
 #[test]
+fn authorized_policy_selects_either_present_serial_and_lowest_when_both_present() {
+    use crate::config::YubikeyPolicy;
+    for (serials, expected) in [
+        (vec![39269826], 39269826),
+        (vec![39269828], 39269828),
+        (vec![39269828, 39269826], 39269826),
+        (vec![39269826, 39269828], 39269826),
+        (vec![123, 39269828], 39269828),
+    ] {
+        let _io = Discovery::new(serials.into_iter().map(Read::Serial).collect());
+        let key = db::build_database_key_with_policy(
+            "synthetic master",
+            None,
+            Some(YubikeyPolicy {
+                slot: 2,
+                serials: vec![39269828, 39269826],
+            }),
+        )
+        .unwrap();
+        assert!(
+            format!("{key:?}").contains(&expected.to_string()),
+            "concrete serial must be retained"
+        );
+    }
+}
+
+#[test]
+fn physical_claim_lives_until_outer_operation_not_key_construction() {
+    use challenge_response::test_support::{Event, Sessions};
+    let io = Sessions::new(vec![Read::Serial(TOKEN.serial)]);
+    let operation = Operation::standard();
+    let key = db::build_database_key_with_yubikey("synthetic master", None, Some(TOKEN)).unwrap();
+    assert_eq!(
+        io.events(),
+        vec![Event::Open(0), Event::Serial(0)],
+        "serial read must use the retained physical handle"
+    );
+    drop(operation);
+    assert_eq!(
+        io.events(),
+        vec![Event::Open(0), Event::Serial(0), Event::Close(0)]
+    );
+    drop(key); // the retained key must not keep USB claims alive
+}
+
+#[test]
+fn nested_kdbx_challenges_reuse_the_same_opened_physical_session() {
+    use challenge_response::test_support::{Event, Sessions};
+    let io = Sessions::new(vec![Read::Serial(TOKEN.serial)]);
+    let operation = Operation::standard();
+    let key = db::build_database_key_with_yubikey("synthetic master", None, Some(TOKEN)).unwrap();
+    let mut bytes = Vec::new();
+    keepass::Database::new()
+        .save(&mut bytes, key.clone())
+        .unwrap();
+    keepass::Database::open(&mut std::io::Cursor::new(&bytes), key.clone()).unwrap();
+    assert_eq!(
+        io.events(),
+        vec![
+            Event::Open(0),
+            Event::Serial(0),
+            Event::Hmac(0),
+            Event::Hmac(0)
+        ]
+    );
+    drop(operation);
+    assert_eq!(io.events().last(), Some(&Event::Close(0)));
+}
+
+#[test]
+fn keepass_direct_challenge_pins_serial_read_and_hmac_without_an_app_wrapper() {
+    use challenge_response::test_support::{Event, Sessions};
+    let io = Sessions::new(vec![Read::Serial(TOKEN.serial)]);
+    let key = db::build_database_key_with_yubikey("synthetic master", None, Some(TOKEN)).unwrap();
+    let before = io.events().len();
+    keepass::Database::new().save(&mut Vec::new(), key).unwrap();
+    assert_eq!(
+        &io.events()[before..],
+        &[
+            Event::Open(0),
+            Event::Serial(0),
+            Event::Hmac(0),
+            Event::Close(0)
+        ],
+        "the library adapter must own an enclosing scope even without Jaiba's outer handler"
+    );
+}
+
+#[test]
 fn native_open_diagnostics_retain_access_and_unsupported_distinctions() {
     let error = challenge_response::test_support::discovery_open_failure(true).unwrap_err();
     assert!(
@@ -100,17 +189,14 @@ fn no_matching_serial_with_unreadable_candidates_is_not_reported_missing() {
 }
 
 #[test]
-fn diagnostic_rescan_that_finds_a_changed_device_never_installs_credentials() {
+fn failed_single_pass_discovery_never_rescans_a_changed_device() {
     let next = std::rc::Rc::new(std::cell::Cell::new(0));
     let _io = Discovery::new(vec![Read::Sequence(
         next,
         vec![Read::Denied, Read::Serial(TOKEN.serial)],
     )]);
     let error = discover(4).unwrap_err();
-    assert!(
-        error.contains("availability changed during discovery"),
-        "{error}"
-    );
+    assert!(error.contains("synthetic serial access denied"), "{error}");
 }
 
 #[test]
@@ -269,7 +355,7 @@ fn already_cancelled_or_expired_discovery_cannot_return_a_device() {
 }
 
 #[test]
-fn keepass_per_challenge_rediscovery_preserves_the_unreadable_diagnostic() {
+fn fresh_native_challenge_selection_preserves_the_unreadable_diagnostic() {
     let key = {
         let _io = Discovery::new(vec![Read::Serial(TOKEN.serial)]);
         db::build_database_key_with_yubikey("synthetic master", None, Some(TOKEN)).unwrap()

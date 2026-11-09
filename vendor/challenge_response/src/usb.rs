@@ -130,6 +130,51 @@ pub trait Backend<DeviceHandle, Interface> {
         Ok(value)
     }
 
+    fn hmac(
+        &self,
+        handle: &mut DeviceHandle,
+        chall: &[u8],
+        conf: &crate::config::Config,
+    ) -> Result<crate::hmacmode::Hmac, ChallengeResponseError> {
+        use crate::{config::Slot, sec::CRC_RESIDUAL_OK};
+        let mut hmac = crate::hmacmode::Hmac([0; 20]);
+        let mut challenge = [0; CHALLENGE_SIZE];
+
+        if conf.variable && chall.last() == Some(&0) {
+            challenge = [0xff; CHALLENGE_SIZE];
+        }
+
+        let mut command = Command::ChallengeHmac1;
+        if let Slot::Slot2 = conf.slot {
+            command = Command::ChallengeHmac2;
+        }
+
+        (&mut challenge[..chall.len()]).copy_from_slice(chall);
+        let d = Frame::new(challenge, command);
+        let mut buf = [0; crate::usb::STATUS_UPDATE_PAYLOAD_SIZE];
+        self.wait(
+            handle,
+            |f| !f.contains(crate::usb::Flags::SLOT_WRITE_FLAG),
+            &mut buf,
+        )?;
+
+        self.write_frame(handle, &d)?;
+
+        // Read the response.
+        let mut response = [0; crate::usb::RESPONSE_SIZE];
+        let _touch_wait = crate::touch::ResponseWait::new();
+        self.read_response(handle, &mut response)?;
+
+        // Check response.
+        if crc16(&response[..22]) != CRC_RESIDUAL_OK {
+            return Err(ChallengeResponseError::WrongCRC);
+        }
+
+        hmac.0.clone_from_slice(&response[..20]);
+
+        Ok(hmac)
+    }
+
     fn read(
         &self,
         handle: &mut DeviceHandle,
@@ -188,6 +233,7 @@ pub trait Backend<DeviceHandle, Interface> {
             }
             crate::operation::native()?;
             let flags = Flags::from_bits_truncate(buf[7]);
+            crate::touch::status(buf[7]);
             if flags.contains(Flags::SLOT_WRITE_FLAG) || flags.is_empty() {
                 // Should store the version
             }
@@ -256,27 +302,32 @@ pub trait Backend<DeviceHandle, Interface> {
         Self: Sized,
     {
         self.with_device(device_bus_id, device_address, |backend, handle| {
-            let challenge = [0; CHALLENGE_SIZE];
-            let command = Command::DeviceSerial;
-
-            let d = Frame::new(challenge, command); // FIXME: do not need a challange
-            let mut buf = [0; STATUS_UPDATE_PAYLOAD_SIZE];
-            backend.wait(handle, |f| !f.contains(Flags::SLOT_WRITE_FLAG), &mut buf)?;
-
-            backend.write_frame(handle, &d)?;
-
-            // Read the response.
-            let mut response = [0; RESPONSE_SIZE];
-            backend.read_response(handle, &mut response)?;
-
-            // Check response.
-            if crc16(&response[..6]) != crate::sec::CRC_RESIDUAL_OK {
-                return Err(ChallengeResponseError::WrongCRC);
-            }
-
-            let serial = structure!("2I").unpack(response[..8].to_vec())?;
-
-            Ok(serial.0)
+            backend.read_serial(handle)
         })
+    }
+
+    fn read_serial(&self, handle: &mut DeviceHandle) -> Result<u32, ChallengeResponseError> {
+        let backend = self;
+        let challenge = [0; CHALLENGE_SIZE];
+        let command = Command::DeviceSerial;
+
+        let d = Frame::new(challenge, command); // FIXME: do not need a challange
+        let mut buf = [0; STATUS_UPDATE_PAYLOAD_SIZE];
+        backend.wait(handle, |f| !f.contains(Flags::SLOT_WRITE_FLAG), &mut buf)?;
+
+        backend.write_frame(handle, &d)?;
+
+        // Read the response.
+        let mut response = [0; RESPONSE_SIZE];
+        backend.read_response(handle, &mut response)?;
+
+        // Check response.
+        if crc16(&response[..6]) != crate::sec::CRC_RESIDUAL_OK {
+            return Err(ChallengeResponseError::WrongCRC);
+        }
+
+        let serial = structure!("2I").unpack(response[..8].to_vec())?;
+
+        Ok(serial.0)
     }
 }

@@ -435,6 +435,7 @@ impl Slot {
 }
 
 pub fn persist(app: &mut App, draft: &Draft) -> anyhow::Result<()> {
+    let _operation = challenge_response::operation::Operation::standard();
     // Cancellation must revoke before starting filesystem transactions or KDFs.
     challenge_response::operation::check()?;
     let origin = draft.validate_origin(app)?;

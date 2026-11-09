@@ -30,7 +30,7 @@ fn opt_in() -> PathBuf {
 fn native_app(f: &Fixture, keyfile: Option<PathBuf>, password: &str) -> App {
     let mut app = App::for_test(Some(f.path()));
     app.screen = Screen::Login;
-    app.config.yubikey = Some(TOKEN);
+    app.config.yubikey = Some(TOKEN.into());
     app.config.keyfile = keyfile;
     authenticate(&mut app, password);
     assert_eq!(app.screen, Screen::Index, "{:?}", app.login_error);
@@ -91,7 +91,7 @@ fn lifecycle(root: &Path, faults: crate::yubikey_test_backend::Model) {
     fs::write(&keyfile, b"new synthetic hardware lifecycle keyfile").unwrap();
     let mut app = App::for_test(Some(f.path()));
     app.screen = Screen::Login;
-    app.config.yubikey = Some(TOKEN);
+    app.config.yubikey = Some(TOKEN.into());
     app.config.keyfile = Some(keyfile.clone());
     input::login::handle_login_input(&mut app, KeyCode::Char('n'));
     app.password = "synthetic master".into();
@@ -158,7 +158,7 @@ fn lifecycle(root: &Path, faults: crate::yubikey_test_backend::Model) {
     assert!(app.lock_cooperatively(), "durable full-factor sidecar");
     drop(app); // release recovery claim to exercise restart
     let mut app = App::for_test(Some(f.path()));
-    app.config.yubikey = Some(TOKEN);
+    app.config.yubikey = Some(TOKEN.into());
     app.config.keyfile = Some(keyfile.clone());
     app.screen = Screen::Login;
     authenticate(&mut app, "synthetic master");

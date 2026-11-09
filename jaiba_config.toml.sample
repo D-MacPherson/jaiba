@@ -15,10 +15,14 @@ clipboard_timeout = 15
 theme = "catppuccin-mocha"
 
 # Optional native YubiKey HMAC-SHA1 factor, IN ADDITION to the password and
-# optional keyfile. Both serial (nonzero u32) and slot (1 or 2) are mandatory.
+# optional keyfile. Explicit serials (nonzero u32 list) and slot (1 or 2) are required.
 # Omit the entire table for existing password/password+keyfile vaults.
 # This selects an already configured key; Jaiba never programs it.
 # Read YUBIKEY.md: touch-enabled keys may block, including cooperative locking.
 # [yubikey]
 # slot = 2
-# serial = 39269826
+# serials = [39269826, 39269828]
+# Either authorized, already-configured physical key may authenticate. If both
+# are accessible, the lowest serial is selected; no mid-operation switching.
+# Legacy singleton serial = 39269826 is still accepted, never auto-expanded.
+# Do not combine serial and serials. See YUBIKEY-MULTI.md.

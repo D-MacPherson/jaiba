@@ -8,12 +8,16 @@ remaining upstream/deployment limitations. Historical test results below are not
 approval of the corrected candidate; a separate fresh review is still required.
 
 This enables the native `keepass` 0.13.20 `challenge_response` implementation for
-one existing YubiKey HMAC-SHA1 slot. It is not device enrollment, key programming,
+an explicitly authorized set of existing YubiKey HMAC-SHA1 devices in one slot. It is not device enrollment, key programming,
 a secret-service replacement, a deployed executable, or a migration tool.
 Historical `R4-LOCKING.md` describes the baseline R4 work; this document adds the
 hardware-factor scope and limitations without changing that protocol.
 
-**Current bounded candidate:** see `YUBIKEY-BOUNDED.md` for the vendored native
+**Current multi-device/pinned-handle amendment:** see `YUBIKEY-MULTI.md`. It supersedes
+the old serial-rediscovery implementation; hardware interchangeability still needs
+separate acceptance against the same disposable ciphertext on both physical keys.
+
+**Bounded-operation background:** see `YUBIKEY-BOUNDED.md` for the vendored native
 30-second shared operation budget, 100ms transfer/cancellation policy, scoped
 interface-zero cleanup, unchanged nonce/replay protocol, and fail-closed
 memory-only hardware signal-lock policy. A waiting touch can no longer keep the
@@ -62,31 +66,40 @@ clipboard_timeout = 15
 
 [yubikey]
 slot = 2
-serial = 39269826
+serials = [39269826, 39269828]
 ```
 
-Both fields are mandatory: slot must be integer 1 or 2; serial must be a nonzero
-u32. No first-device selection, optional-serial ambiguity, environment override,
-auto-detection, or silent fallback is provided. Omit the entire table to retain
+Both fields are mandatory: slot must be integer 1 or 2; serials must be a nonempty
+list of distinct nonzero u32 values. Legacy `serial = 39269826` authorizes only that
+singleton, never both devices; `serial` and `serials` cannot be mixed. Accessible
+authorized devices are selected by ascending serial, independent of enumeration
+or configuration order. No unrestricted first-device selection, environment
+override, enrollment, or silent fallback is provided. Omit the entire table to retain
 existing password-only/password+keyfile behavior. Unknown/misspelled settings,
 partial tables, wrong types, out-of-range values and malformed TOML fail startup
 rather than replacing the config with defaults. Saving settings retains the
 complete hardware table. Changing config does not enroll/change a vault's factors.
 
 A successful open/create pins database path, keyfile preference and hardware
-selection for that session, including subsequent lock/reauthentication and
-master-password changes. Preferences apply to a new session, not an already
+authorization policy for that session, including subsequent lock/reauthentication
+and master-password changes. The retained complete key holds only the concrete
+selected serial/slot; a fresh full-factor reauthentication may use another device
+from the frozen policy. A write using a retained key never substitutes another
+serial if its selected key is unavailable. Preferences apply to a new session, not an already
 opened vault. A password change preserves keyfile+hardware; no in-app hardware
 removal/rotation or hardware-only authentication is implemented. Jaiba continues
 to add its password contribution even when the entered password is empty.
 
 ## Actual library integration and supported formats
 
-The builder calls `ChallengeResponseKey::get_yubikey(Some(serial))`, constructs
-`ChallengeResponseKey::YubikeyChallenge(device, slot.to_string())`, and attaches it
-with `DatabaseKey::with_challenge_response_key`. Enumeration itself performs USB
-I/O, and each challenge re-finds the serial. Serial is a selection hint, not
-cryptographic attestation of a physical device.
+The builder calls the vendored `ChallengeResponseKey::get_authorized_yubikey(serials)`,
+constructs `ChallengeResponseKey::YubikeyChallenge(device, slot.to_string())`, and
+attaches it with `DatabaseKey::with_challenge_response_key`. Enumeration itself
+performs USB I/O. Authorization reads the serial on the exact opened handle whose
+OTP interface-zero claim is retained until the outer operation ends. Nested
+challenges reuse that handle, not a reopened bus/address or serial match. Reported
+transfer failure poisons the operation; no retry or substitution follows. Serial
+is a public selection hint, not cryptographic attestation of a physical device.
 
 Both native discovery entrypoints isolate ordinary per-device serial access,
 busy, disconnection and unsupported-layout errors, so an unreadable neighbor
@@ -101,14 +114,17 @@ candidate's serial-read/open) stay fatal;
 checks occur after actual I/O before classifying an error. nusb open detail and
 unsupported-layout errors remain distinguishable.
 
-KeePass filters `serial: None` and flattens a no-match result. Only after its
-`NoKeys`/`KeyNotFound` error, the app uses native explicit-serial discovery for a
-diagnostic rescan under the same budget. If the token appears meanwhile, the app
-still refuses authentication and asks for a full-factor retry. The existing
-KeePass constructor is retained because its descriptor type is not exported as
-a nameable public type. A completed hardware exchange with wrong password,
-keyfile or slot secret normally becomes `Incorrect key`: it cannot reliably say
-which factor was wrong. Jaiba does not retry with a factor omitted.
+The app no longer uses KeePass's filtering constructor or a diagnostic rescan.
+A single native pass retains the first unreadable diagnostic when no authorized
+device is accessible; global list/cancellation/deadline errors remain fatal even
+after a candidate matches. An accessible authorized neighbor tolerates ordinary
+per-device probe failure. The library adapter returns its concrete descriptor
+without exporting its type or retaining claims in `DatabaseKey`. A completed
+hardware exchange with wrong password, keyfile or slot secret normally becomes
+`Incorrect key`: it cannot reliably say which factor was wrong. Jaiba does not
+retry with a factor omitted. Matching serial authorization/slot numbers do not
+make differently programmed keys interchangeable: their existing factor material
+must already match. No programming, secret export or migration is performed.
 
 The app retains the **unperformed** complete `DatabaseKey`. KDBX4 open/save use
 consumed clones; the library performs the challenge using that container's KDF
